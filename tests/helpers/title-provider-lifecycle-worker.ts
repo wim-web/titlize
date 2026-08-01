@@ -2,13 +2,20 @@ import { BunCommandRunner } from "../../src/codex-title-provider";
 import { appendFileSync } from "node:fs";
 
 const [mode, pidFile, markerFile] = Bun.argv.slice(2);
-if ((mode !== "signal" && mode !== "exit" && mode !== "host-signal") || !pidFile) {
+if (
+  (mode !== "signal" && mode !== "exit" && mode !== "host-signal" && mode !== "host-once-signal") ||
+  !pidFile
+) {
   process.exit(2);
 }
 
-if (mode === "host-signal") {
+if (mode === "host-signal" || mode === "host-once-signal") {
   if (!markerFile) process.exit(2);
-  process.on("SIGTERM", () => appendFileSync(markerFile, "before\n"));
+  if (mode === "host-signal") {
+    process.on("SIGTERM", () => appendFileSync(markerFile, "before\n"));
+  } else {
+    process.once("SIGTERM", () => appendFileSync(markerFile, "once\n"));
+  }
 }
 
 if (mode === "exit") {
@@ -43,7 +50,7 @@ try {
   // The lifecycle tests intentionally terminate this wrapper while the run is active.
 }
 
-if (mode === "host-signal") {
+if (mode === "host-signal" || mode === "host-once-signal") {
   appendFileSync(markerFile!, `remaining:${process.listenerCount("SIGTERM")}\ncompleted\n`);
   process.exit(0);
 }
