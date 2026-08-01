@@ -10,6 +10,7 @@ type SessionRow = {
   pending_update: number;
   last_auto_title: string | null;
   pending_title: string | null;
+  pending_previous_title: string | null;
   auto_update_disabled: number;
   last_success_at: string | null;
   updated_at: string;
@@ -23,6 +24,7 @@ const schema = `
     pending_update INTEGER NOT NULL CHECK(pending_update IN (0, 1)),
     last_auto_title TEXT,
     pending_title TEXT,
+    pending_previous_title TEXT,
     auto_update_disabled INTEGER NOT NULL CHECK(auto_update_disabled IN (0, 1)),
     last_success_at TEXT,
     updated_at TEXT NOT NULL
@@ -43,6 +45,7 @@ function toSessionState(row: SessionRow): SessionState {
     pendingUpdate: row.pending_update === 1,
     lastAutoTitle: row.last_auto_title,
     pendingTitle: row.pending_title,
+    pendingPreviousTitle: row.pending_previous_title,
     autoUpdateDisabled: row.auto_update_disabled === 1,
     lastSuccessAt: row.last_success_at,
     updatedAt: row.updated_at,
@@ -60,7 +63,7 @@ export class StateStore {
     this.db.exec("PRAGMA foreign_keys = ON");
     try {
       this.db.exec(schema);
-      this.migratePendingTitle();
+      this.migrateTitleIntentColumns();
     } catch (error) {
       try {
         this.db.close();
@@ -89,8 +92,8 @@ export class StateStore {
         .query(
           `INSERT INTO sessions (
             session_id, stop_count, last_turn_id, pending_update, last_auto_title,
-            pending_title, auto_update_disabled, last_success_at, updated_at
-          ) VALUES (?, 0, NULL, 0, NULL, NULL, 0, NULL, ?)
+            pending_title, pending_previous_title, auto_update_disabled, last_success_at, updated_at
+          ) VALUES (?, 0, NULL, 0, NULL, NULL, NULL, 0, NULL, ?)
           ON CONFLICT(session_id) DO NOTHING`,
         )
         .run(sessionId, now);
@@ -131,7 +134,8 @@ export class StateStore {
       sessionId,
       now,
       `pending_update = 0, last_auto_title = excluded.last_auto_title,
-       pending_title = NULL, last_success_at = excluded.last_success_at,
+       pending_title = NULL, pending_previous_title = NULL,
+       last_success_at = excluded.last_success_at,
        updated_at = excluded.updated_at`,
       title,
     );
@@ -142,7 +146,8 @@ export class StateStore {
       sessionId,
       now,
       `pending_update = 0, last_auto_title = excluded.last_auto_title, auto_update_disabled = 0,
-       pending_title = NULL, last_success_at = excluded.last_success_at,
+       pending_title = NULL, pending_previous_title = NULL,
+       last_success_at = excluded.last_success_at,
        updated_at = excluded.updated_at`,
       title,
     );
@@ -152,7 +157,8 @@ export class StateStore {
     return this.upsert(
       sessionId,
       now,
-      `pending_update = 0, pending_title = NULL, auto_update_disabled = 1,
+      `pending_update = 0, pending_title = NULL, pending_previous_title = NULL,
+       auto_update_disabled = 1,
        updated_at = excluded.updated_at`,
       null,
       false,
@@ -160,16 +166,23 @@ export class StateStore {
     );
   }
 
-  markTitleWritePending(sessionId: string, title: string, now: string): SessionState {
+  markTitleWritePending(
+    sessionId: string,
+    title: string,
+    previousTitle: string | null,
+    now: string,
+  ): SessionState {
     return this.upsert(
       sessionId,
       now,
       `pending_update = 1, pending_title = excluded.pending_title,
+       pending_previous_title = excluded.pending_previous_title,
        updated_at = excluded.updated_at`,
       null,
       true,
       false,
       title,
+      previousTitle,
     );
   }
 
@@ -177,7 +190,8 @@ export class StateStore {
     return this.upsert(
       sessionId,
       now,
-      `pending_update = 1, pending_title = NULL, updated_at = excluded.updated_at`,
+      `pending_update = 1, pending_title = NULL, pending_previous_title = NULL,
+       updated_at = excluded.updated_at`,
       null,
       true,
     );
@@ -191,13 +205,14 @@ export class StateStore {
     pendingUpdate = false,
     autoUpdateDisabled = false,
     pendingTitle: string | null = null,
+    pendingPreviousTitle: string | null = null,
   ): SessionState {
     this.db
       .query(
         `INSERT INTO sessions (
           session_id, stop_count, last_turn_id, pending_update, last_auto_title,
-          pending_title, auto_update_disabled, last_success_at, updated_at
-        ) VALUES (?, 0, NULL, ?, ?, ?, ?, ?, ?)
+          pending_title, pending_previous_title, auto_update_disabled, last_success_at, updated_at
+        ) VALUES (?, 0, NULL, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET ${updates}`,
       )
       .run(
@@ -205,6 +220,7 @@ export class StateStore {
         pendingUpdate ? 1 : 0,
         title,
         pendingTitle,
+        pendingPreviousTitle,
         autoUpdateDisabled ? 1 : 0,
         title === null ? null : now,
         now,
@@ -212,15 +228,19 @@ export class StateStore {
     return this.requireSession(sessionId);
   }
 
-  private migratePendingTitle(): void {
-    if (this.hasPendingTitleColumn()) return;
+  private migrateTitleIntentColumns(): void {
+    if (this.hasTitleIntentColumns()) return;
 
     let transactionOpen = false;
     try {
       this.db.exec("BEGIN IMMEDIATE");
       transactionOpen = true;
-      if (!this.hasPendingTitleColumn()) {
+      const columns = this.sessionColumnNames();
+      if (!columns.has("pending_title")) {
         this.db.exec("ALTER TABLE sessions ADD COLUMN pending_title TEXT");
+      }
+      if (!columns.has("pending_previous_title")) {
+        this.db.exec("ALTER TABLE sessions ADD COLUMN pending_previous_title TEXT");
       }
       this.db.exec("COMMIT");
       transactionOpen = false;
@@ -236,11 +256,16 @@ export class StateStore {
     }
   }
 
-  private hasPendingTitleColumn(): boolean {
-    return this.db
+  private hasTitleIntentColumns(): boolean {
+    const columns = this.sessionColumnNames();
+    return columns.has("pending_title") && columns.has("pending_previous_title");
+  }
+
+  private sessionColumnNames(): Set<string> {
+    return new Set(this.db
       .query<{ name: string }, []>("PRAGMA table_info(sessions)")
       .all()
-      .some((column) => column.name === "pending_title");
+      .map((column) => column.name));
   }
 
   private requireSession(sessionId: string): SessionState {

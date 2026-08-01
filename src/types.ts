@@ -21,6 +21,7 @@ export interface SessionState {
   pendingUpdate: boolean;
   lastAutoTitle: string | null;
   pendingTitle: string | null;
+  pendingPreviousTitle: string | null;
   autoUpdateDisabled: boolean;
   lastSuccessAt: string | null;
   updatedAt: string;

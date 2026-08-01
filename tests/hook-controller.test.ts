@@ -236,7 +236,7 @@ describe("HookController", () => {
   test("停止済みでも書込みintentがあれば回復のためserviceを呼ぶ", async () => {
     const store = openStore();
     store.markAutoUpdateDisabled("s1", "disabled");
-    store.markTitleWritePending("s1", "force-intent", "intent");
+    store.markTitleWritePending("s1", "force-intent", "before-force", "intent");
     const h = harness({ every: 3, store });
 
     await h.controller.handle(stop("s1", "t1"));

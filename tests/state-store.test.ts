@@ -39,6 +39,7 @@ describe("StateStore", () => {
         pendingUpdate: false,
         lastAutoTitle: null,
         pendingTitle: null,
+        pendingPreviousTitle: null,
         autoUpdateDisabled: false,
         lastSuccessAt: null,
         updatedAt: "2026-08-01T00:00:00.000Z",
@@ -143,7 +144,7 @@ describe("StateStore", () => {
     const { store } = openStore();
     expect(store.markPending("new", "now")).toEqual({
       sessionId: "new", stopCount: 0, lastTurnId: null, pendingUpdate: true,
-      lastAutoTitle: null, pendingTitle: null, autoUpdateDisabled: false,
+      lastAutoTitle: null, pendingTitle: null, pendingPreviousTitle: null, autoUpdateDisabled: false,
       lastSuccessAt: null, updatedAt: "now",
     });
     store.markSuccess("new", "old title", "success");
@@ -168,7 +169,7 @@ describe("StateStore", () => {
 
     expect(store.markForcedSuccess("new", "forced", "forced-at")).toEqual({
       sessionId: "new", stopCount: 0, lastTurnId: null, pendingUpdate: false,
-      lastAutoTitle: "forced", pendingTitle: null, autoUpdateDisabled: false,
+      lastAutoTitle: "forced", pendingTitle: null, pendingPreviousTitle: null, autoUpdateDisabled: false,
       lastSuccessAt: "forced-at", updatedAt: "forced-at",
     });
   });
@@ -200,10 +201,11 @@ describe("StateStore", () => {
     store.recordStop("s1", "t1", "stop");
     store.markSuccess("s1", "old", "success");
 
-    expect(store.markTitleWritePending("s1", "candidate", "intent")).toEqual(
+    expect(store.markTitleWritePending("s1", "candidate", "before", "intent")).toEqual(
       expect.objectContaining({
         pendingUpdate: true,
         pendingTitle: "candidate",
+        pendingPreviousTitle: "before",
         lastAutoTitle: "old",
         updatedAt: "intent",
       }),
@@ -211,6 +213,7 @@ describe("StateStore", () => {
     expect(store.markPending("s1", "retry")).toEqual(expect.objectContaining({
       pendingUpdate: true,
       pendingTitle: "candidate",
+      pendingPreviousTitle: "before",
       lastAutoTitle: "old",
       updatedAt: "retry",
     }));
@@ -220,24 +223,26 @@ describe("StateStore", () => {
     const path = join(mkdtempSync(join(tmpdir(), "titlize-state-intent-")), "state.sqlite3");
     const first = openStore(path).store;
     first.markSuccess("s1", "old", "success");
-    first.markTitleWritePending("s1", "candidate", "intent");
+    first.markTitleWritePending("s1", "candidate", null, "intent");
     closeStore(first);
 
     const second = openStore(path).store;
     expect(second.getSession("s1")).toEqual(expect.objectContaining({
       pendingUpdate: true,
       pendingTitle: "candidate",
+      pendingPreviousTitle: null,
       lastAutoTitle: "old",
     }));
   });
 
   test("書込みintentだけをclearして通常retryのpendingを維持する", () => {
     const { store } = openStore();
-    store.markTitleWritePending("s1", "candidate", "intent");
+    store.markTitleWritePending("s1", "candidate", "before", "intent");
 
     expect(store.clearTitleWritePending("s1", "clear")).toEqual(expect.objectContaining({
       pendingUpdate: true,
       pendingTitle: null,
+      pendingPreviousTitle: null,
       updatedAt: "clear",
     }));
   });
@@ -248,9 +253,12 @@ describe("StateStore", () => {
     ["markAutoUpdateDisabled", (store: StateStore) => store.markAutoUpdateDisabled("s1", "done")],
   ] as const)("%sは保存済み書込みintentをclearする", (_name, finish) => {
     const { store } = openStore();
-    store.markTitleWritePending("s1", "candidate", "intent");
+    store.markTitleWritePending("s1", "candidate", "before", "intent");
 
-    expect(finish(store)).toEqual(expect.objectContaining({ pendingTitle: null }));
+    expect(finish(store)).toEqual(expect.objectContaining({
+      pendingTitle: null,
+      pendingPreviousTitle: null,
+    }));
   });
 
   test("pending_titleのない旧sessions schemaを既存行を保ったままmigrationする", () => {
@@ -288,14 +296,61 @@ describe("StateStore", () => {
       pendingUpdate: true,
       lastAutoTitle: "legacy-title",
       pendingTitle: null,
+      pendingPreviousTitle: null,
       autoUpdateDisabled: false,
       lastSuccessAt: "legacy-success",
       updatedAt: "legacy-updated",
     });
     expect(store.recordStop("legacy-session", "legacy-turn", "duplicate").isNewTurn).toBe(false);
-    expect(store.markTitleWritePending("legacy-session", "new-title", "intent")).toEqual(
-      expect.objectContaining({ stopCount: 7, pendingTitle: "new-title" }),
+    expect(store.markTitleWritePending("legacy-session", "new-title", "legacy-title", "intent")).toEqual(
+      expect.objectContaining({
+        stopCount: 7,
+        pendingTitle: "new-title",
+        pendingPreviousTitle: "legacy-title",
+      }),
     );
+  });
+
+  test("pending_titleだけを持つ旧schemaをintentを失わずmigrationする", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "titlize-state-intermediate-")), "state.sqlite3");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE sessions (
+        session_id TEXT PRIMARY KEY,
+        stop_count INTEGER NOT NULL,
+        last_turn_id TEXT,
+        pending_update INTEGER NOT NULL,
+        last_auto_title TEXT,
+        pending_title TEXT,
+        auto_update_disabled INTEGER NOT NULL,
+        last_success_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE processed_turns (
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        PRIMARY KEY(session_id, turn_id)
+      );
+      INSERT INTO sessions VALUES (
+        'legacy-intent', 3, 't3', 1, NULL, 'candidate', 0, NULL, 'legacy-updated'
+      );
+    `);
+    legacy.close();
+
+    const store = openStore(path).store;
+
+    expect(store.getSession("legacy-intent")).toEqual({
+      sessionId: "legacy-intent",
+      stopCount: 3,
+      lastTurnId: "t3",
+      pendingUpdate: true,
+      lastAutoTitle: null,
+      pendingTitle: "candidate",
+      pendingPreviousTitle: null,
+      autoUpdateDisabled: false,
+      lastSuccessAt: null,
+      updatedAt: "legacy-updated",
+    });
   });
 
   test("close 後の DB 操作は閉鎖済み接続として失敗する", () => {

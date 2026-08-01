@@ -22,6 +22,7 @@ function session(overrides: Partial<SessionState> = {}): SessionState {
     pendingUpdate: false,
     lastAutoTitle: null,
     pendingTitle: null,
+    pendingPreviousTitle: null,
     autoUpdateDisabled: false,
     lastSuccessAt: null,
     updatedAt: "before",
@@ -66,6 +67,7 @@ class FakeStore implements TitleUpdateStateStore {
       pendingUpdate: false,
       lastAutoTitle: title,
       pendingTitle: null,
+      pendingPreviousTitle: null,
       lastSuccessAt: now,
       updatedAt: now,
     });
@@ -79,6 +81,7 @@ class FakeStore implements TitleUpdateStateStore {
       pendingUpdate: false,
       lastAutoTitle: title,
       pendingTitle: null,
+      pendingPreviousTitle: null,
       autoUpdateDisabled: false,
       lastSuccessAt: now,
       updatedAt: now,
@@ -92,18 +95,25 @@ class FakeStore implements TitleUpdateStateStore {
     this.state = this.nextState(sessionId, {
       pendingUpdate: false,
       pendingTitle: null,
+      pendingPreviousTitle: null,
       autoUpdateDisabled: true,
       updatedAt: now,
     });
     return structuredClone(this.state);
   }
 
-  markTitleWritePending(sessionId: string, title: string, now: string): SessionState {
+  markTitleWritePending(
+    sessionId: string,
+    title: string,
+    previousTitle: string | null,
+    now: string,
+  ): SessionState {
     this.calls.push("markTitleWritePending");
     if (this.failOn === "markTitleWritePending") throw new Error("state-secret");
     this.state = this.nextState(sessionId, {
       pendingUpdate: true,
       pendingTitle: title,
+      pendingPreviousTitle: previousTitle,
       updatedAt: now,
     });
     return structuredClone(this.state);
@@ -115,6 +125,7 @@ class FakeStore implements TitleUpdateStateStore {
     this.state = this.nextState(sessionId, {
       pendingUpdate: true,
       pendingTitle: null,
+      pendingPreviousTitle: null,
       updatedAt: now,
     });
     return structuredClone(this.state);
@@ -127,6 +138,7 @@ class FakeStore implements TitleUpdateStateStore {
       lastTurnId: this.state?.lastTurnId ?? null,
       lastAutoTitle: this.state?.lastAutoTitle ?? null,
       pendingTitle: this.state?.pendingTitle ?? null,
+      pendingPreviousTitle: this.state?.pendingPreviousTitle ?? null,
       autoUpdateDisabled: this.state?.autoUpdateDisabled ?? false,
       lastSuccessAt: this.state?.lastSuccessAt ?? null,
       ...overrides,
@@ -439,6 +451,7 @@ describe("TitleUpdateService", () => {
     expect(h.store.state).toEqual(expect.objectContaining({
       pendingUpdate: true,
       pendingTitle: "B",
+      pendingPreviousTitle: "A",
       lastAutoTitle: "A",
     }));
     expect(currentTitleRef.value).toBe("A");
@@ -455,6 +468,7 @@ describe("TitleUpdateService", () => {
     expect(h.store.state).toEqual(expect.objectContaining({
       pendingUpdate: false,
       pendingTitle: null,
+      pendingPreviousTitle: null,
       lastAutoTitle: "B",
     }));
   });
@@ -472,6 +486,7 @@ describe("TitleUpdateService", () => {
     await expect(h.service.update(request)).rejects.toBeInstanceOf(TitleUpdateError);
     expect(currentTitleRef.value).toBe("B");
     expect(h.store.state?.pendingTitle).toBe("B");
+    expect(h.store.state?.pendingPreviousTitle).toBe("A");
     h.calls.length = 0;
 
     await expect(h.service.update(request)).resolves.toEqual({ status: "unchanged" });
@@ -481,6 +496,7 @@ describe("TitleUpdateService", () => {
     expect(h.store.state).toEqual(expect.objectContaining({
       pendingUpdate: false,
       pendingTitle: null,
+      pendingPreviousTitle: null,
       lastAutoTitle: "B",
     }));
   });
@@ -500,6 +516,7 @@ describe("TitleUpdateService", () => {
     expect(h.store.state).toEqual(expect.objectContaining({
       pendingUpdate: true,
       pendingTitle: "B",
+      pendingPreviousTitle: "A",
       lastAutoTitle: "A",
     }));
     h.store.failOn = undefined;
@@ -512,13 +529,19 @@ describe("TitleUpdateService", () => {
     expect(h.store.state).toEqual(expect.objectContaining({
       pendingUpdate: false,
       pendingTitle: null,
+      pendingPreviousTitle: null,
       lastAutoTitle: "B",
     }));
   });
 
   test("intent・前回自動名のどちらとも異なる現在名は手動変更として停止する", async () => {
     const h = harness({
-      initial: session({ lastAutoTitle: "A", pendingTitle: "B", pendingUpdate: true }),
+      initial: session({
+        lastAutoTitle: "A",
+        pendingTitle: "B",
+        pendingPreviousTitle: "A",
+        pendingUpdate: true,
+      }),
       currentTitle: "M",
     });
 
@@ -532,13 +555,19 @@ describe("TitleUpdateService", () => {
     expect(h.store.state).toEqual(expect.objectContaining({
       pendingUpdate: false,
       pendingTitle: null,
+      pendingPreviousTitle: null,
       autoUpdateDisabled: true,
     }));
   });
 
   test("初回intent未適用はintentをclearして通常生成を再試行する", async () => {
     const h = harness({
-      initial: session({ lastAutoTitle: null, pendingTitle: "B", pendingUpdate: true }),
+      initial: session({
+        lastAutoTitle: null,
+        pendingTitle: "B",
+        pendingPreviousTitle: "既存タイトル",
+        pendingUpdate: true,
+      }),
       currentTitle: "既存タイトル",
       candidate: "C",
     });
@@ -551,8 +580,71 @@ describe("TitleUpdateService", () => {
     expect(h.calls).toContain("clearTitleWritePending");
     expect(h.store.state).toEqual(expect.objectContaining({
       pendingTitle: null,
+      pendingPreviousTitle: null,
       lastAutoTitle: "C",
     }));
+  });
+
+  test("初回書込み適用後に成功記録が失敗し手動変更されたら上書きせず停止する", async () => {
+    const currentTitleRef: { value: string | undefined } = { value: "A" };
+    const h = harness({
+      initial: session({ lastAutoTitle: null }),
+      currentTitleRef,
+      candidate: "B",
+    });
+    const request = { sessionId: "s1", transcriptPath: TRANSCRIPT_PATH, force: false } as const;
+    h.store.failOn = "markSuccess";
+
+    await expect(h.service.update(request)).rejects.toBeInstanceOf(TitleUpdateError);
+    expect(h.store.state).toEqual(expect.objectContaining({
+      pendingUpdate: true,
+      pendingTitle: "B",
+      pendingPreviousTitle: "A",
+      lastAutoTitle: null,
+    }));
+    currentTitleRef.value = "M";
+    h.store.failOn = undefined;
+    h.calls.length = 0;
+
+    await expect(h.service.update(request)).resolves.toEqual({ status: "manual-change" });
+    expect(h.calls).toEqual(["getSession", "markPending", "readTitle", "markAutoUpdateDisabled"]);
+    expect(h.calls).not.toContain("generateTitle");
+    expect(h.calls).not.toContain("setTitle");
+    expect(currentTitleRef.value).toBe("M");
+    expect(h.store.state).toEqual(expect.objectContaining({
+      pendingUpdate: false,
+      pendingTitle: null,
+      pendingPreviousTitle: null,
+      autoUpdateDisabled: true,
+      lastAutoTitle: null,
+    }));
+  });
+
+  test("変更前タイトルがnullの未適用intentはclearして通常生成を再試行する", async () => {
+    const currentTitleRef: { value: string | undefined } = { value: undefined };
+    const h = harness({
+      initial: session({ lastAutoTitle: null }),
+      currentTitleRef,
+      candidate: "B",
+      setTitleOutcomes: [{ apply: false, error: new Error("set-secret") }],
+    });
+    const request = { sessionId: "s1", transcriptPath: TRANSCRIPT_PATH, force: false } as const;
+
+    await expect(h.service.update(request)).rejects.toBeInstanceOf(TitleUpdateError);
+    expect(h.store.state).toEqual(expect.objectContaining({
+      pendingUpdate: true,
+      pendingTitle: "B",
+      pendingPreviousTitle: null,
+    }));
+    h.calls.length = 0;
+
+    await expect(h.service.update(request)).resolves.toEqual({ status: "updated" });
+    expect(h.calls).toEqual([
+      "getSession", "markPending", "readTitle", "clearTitleWritePending",
+      "readTranscript", "generateTitle", "readTitle", "markTitleWritePending",
+      "setTitle", "markSuccess",
+    ]);
+    expect(currentTitleRef.value).toBe("B");
   });
 
   test("通常更新でTranscriptパスがなければpendingを残しApp Server会話へfallbackしない", async () => {
@@ -579,7 +671,7 @@ describe("TitleUpdateService", () => {
 
     expect(h.calls).toEqual([
       "getSession", "markPending", "readTitle", "readTranscript", "generateTitle",
-      "markTitleWritePending", "setTitle", "markForcedSuccess",
+      "readTitle", "markTitleWritePending", "setTitle", "markForcedSuccess",
     ]);
     expect(h.calls).not.toContain("markAutoUpdateDisabled");
     expect(h.store.state).toEqual(expect.objectContaining({
@@ -604,7 +696,7 @@ describe("TitleUpdateService", () => {
     releaseProvider();
 
     await expect(update).resolves.toEqual({ status: "updated" });
-    expect(h.calls.filter((call) => call === "readTitle")).toHaveLength(1);
+    expect(h.calls.filter((call) => call === "readTitle")).toHaveLength(2);
     expect(h.setTitles).toEqual([{ sessionId: "s1", title: "F" }]);
     expect(currentTitleRef.value).toBe("F");
   });
@@ -690,7 +782,7 @@ describe("TitleUpdateService", () => {
 
     expect(h.calls).toEqual([
       "getSession", "markPending", "readTitle", "readConversation", "generateTitle",
-      "markTitleWritePending", "setTitle", "markForcedSuccess",
+      "readTitle", "markTitleWritePending", "setTitle", "markForcedSuccess",
     ]);
     expect(h.readerPaths).toEqual([]);
   });
@@ -792,6 +884,36 @@ describe("TitleUpdateService", () => {
     await expect(rejection).rejects.toBeInstanceOf(TitleUpdateError);
     await expect(rejection).rejects.toThrow("title update state operation failed");
     await expect(rejection).rejects.not.toThrow(/secret/);
+    expect(h.calls).toEqual([]);
+  });
+
+  test("pendingPreviousTitleの不正値を外部処理前に安全なstate errorへ変換する", async () => {
+    const h = harness();
+    h.store.getSession = () => ({
+      ...session(),
+      pendingTitle: "candidate",
+      pendingPreviousTitle: 42,
+    }) as unknown as SessionState;
+
+    const rejection = h.service.update({
+      sessionId: "s1",
+      transcriptPath: TRANSCRIPT_PATH,
+      force: false,
+    });
+    await expect(rejection).rejects.toBeInstanceOf(TitleUpdateError);
+    await expect(rejection).rejects.toThrow("title update state operation failed");
+    expect(h.calls).toEqual([]);
+  });
+
+  test("候補のない孤立したpendingPreviousTitleを不正stateとして拒否する", async () => {
+    const h = harness();
+    h.store.getSession = () => session({ pendingPreviousTitle: "orphan" });
+
+    await expect(h.service.update({
+      sessionId: "s1",
+      transcriptPath: TRANSCRIPT_PATH,
+      force: false,
+    })).rejects.toEqual(TitleUpdateError.for("state_failed"));
     expect(h.calls).toEqual([]);
   });
 
