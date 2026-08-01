@@ -1,0 +1,17 @@
+{
+  "description": "Stopごとに会話内容からCodexタスク名を定期更新する",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$(git rev-parse --show-toplevel)/src/cli.ts\" hook",
+            "timeout": 120,
+            "statusMessage": "タスク名を更新しています"
+          }
+        ]
+      }
+    ]
+  }
+}
