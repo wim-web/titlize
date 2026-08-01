@@ -44,10 +44,17 @@ describe("validateTitle", () => {
     );
   });
 
-  test("外側のbacktickだけを剥がし、内部backtickと不一致backtickを保持する", () => {
-    expect(validateTitle("`outer `inner` text`", 40)).toBe("outer `inner` text");
+  test("対応backtickを初回正規化で除去し、不一致backtickは保持する", () => {
+    expect(validateTitle("`outer `inner` text`", 40)).toBe("outer inner text");
     expect(validateTitle("unmatched`", 40)).toBe("unmatched`");
     expect(validateTitle("通常 `inline` code", 40)).toBe("通常 inline code");
+    expect(validateTitle(validateTitle("`outer `inner` text`", 40), 40)).toBe("outer inner text");
+  });
+
+  test("入れ子のURL placeholderを漏らさず復元する", () => {
+    const normalized = validateTitle("`https://example.test/a`inner``", 200);
+    expect(normalized).toBe("https://example.test/ainner");
+    expect(validateTitle(normalized, 200)).toBe(normalized);
   });
 
   test.each(['""', "''", "``", "“”", "‘’", "「」", "『』", "【】"])(
@@ -88,6 +95,18 @@ describe("validateTitle", () => {
     expect(validateTitle("https://example.test/a'**b**", 60)).toBe("https://example.test/a'**b**");
     expect(validateTitle("https://example.test/a'_b_", 60)).toBe("https://example.test/a'_b_");
     expect(validateTitle("https://example.test/a'~~b~~", 60)).toBe("https://example.test/a'~~b~~");
+  });
+
+  test("apostropheで囲んだURLの外側Markdownを除去し、裸URLの内部apostropheは保持する", () => {
+    expect(validateTitle("**'https://example.test/a'**", 200)).toBe("https://example.test/a");
+    expect(validateTitle("https://example.test/a'**b**", 200)).toBe("https://example.test/a'**b**");
+  });
+
+  test("PUAを多く含む入力とURLを衝突なく正規化する", () => {
+    const pua = "\uE100";
+    const raw = `${pua}https://x.test ${pua}https://x.test`;
+    expect(validateTitle(raw, 200)).toBe(raw);
+    expect(validateTitle(`${pua.repeat(4000)} https://x.test`, 4096)).toBe(`${pua.repeat(4000)} https://x.test`);
   });
 
   test("URLを囲むMarkdownだけを除去し、囲まれていないURL末尾記号は保持する", () => {

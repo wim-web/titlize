@@ -166,6 +166,10 @@ function findClosingParenthesis(value: string, start: number): number {
 
 function protectUrls(value: string, placeholders: PlaceholderStore): string {
   return value.replace(/https?:\/\/[^\s"“”‘’「」『』【】`]+/g, (url, offset: number, input: string) => {
+    const quotedOpening = readOpeningMarkers(input, offset - 1);
+    if (input[offset - 1] === "'" && quotedOpening && url.endsWith(`'${quotedOpening}`)) {
+      return `${placeholders.create("url", url.slice(0, -quotedOpening.length - 1))}'${quotedOpening}`;
+    }
     const expectedClosing = readOpeningMarkers(input, offset);
     if (expectedClosing) {
       const suffix = url.match(/[.,;:!?。、\)\]\}]+$/)?.[0] ?? "";
@@ -268,7 +272,7 @@ function stripInlineCode(value: string): string {
   return result;
 }
 
-function unwrapQuotes(value: string, placeholders: PlaceholderStore): string {
+function unwrapQuotes(value: string, _placeholders: PlaceholderStore): string {
   let result = value;
   let changed = true;
   while (changed) {
@@ -276,7 +280,7 @@ function unwrapQuotes(value: string, placeholders: PlaceholderStore): string {
     for (const [opening, closing] of quotePairs) {
       if (result.startsWith(opening) && result.endsWith(closing) && result.length >= opening.length + closing.length) {
         const inner = result.slice(opening.length, -closing.length).trim();
-        result = opening === "`" ? inner.replace(/`/g, (tick) => placeholders.create("backtick", tick)) : inner;
+        result = inner;
         changed = true;
         break;
       }
@@ -290,20 +294,43 @@ class PlaceholderStore {
   private readonly namespace: string;
 
   constructor(raw: string) {
-    let namespace = "\uE100";
-    while (raw.includes(namespace)) namespace += "\uE100";
-    this.namespace = namespace;
+    for (let codePoint = 0xe000; codePoint <= 0xf8ff; codePoint += 1) {
+      const candidate = String.fromCharCode(codePoint);
+      if (!raw.includes(candidate)) {
+        this.namespace = candidate;
+        return;
+      }
+    }
+    throw TitleValidationError.tooLong();
   }
 
-  create(kind: "url" | "backtick", value: string): string {
-    const token = `${this.namespace}${kind}${this.tokens.size}${this.namespace}`;
+  create(_kind: "url" | "backtick", value: string): string {
+    const token = `${this.namespace}${this.tokens.size.toString(36)}${this.namespace}`;
     this.tokens.set(token, value);
     return token;
   }
 
   restore(value: string): string {
-    let result = value;
-    for (const [token, original] of this.tokens) result = result.split(token).join(original);
+    let result = "";
+    for (let index = 0; index < value.length; index += 1) {
+      if (value[index] !== this.namespace) {
+        result += value[index];
+        continue;
+      }
+      const end = value.indexOf(this.namespace, index + 1);
+      if (end === -1) {
+        result += value[index];
+        continue;
+      }
+      const token = value.slice(index, end + 1);
+      const original = this.tokens.get(token);
+      if (original === undefined) {
+        result += value[index];
+        continue;
+      }
+      result += original;
+      index = end;
+    }
     return result;
   }
 }
