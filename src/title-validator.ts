@@ -43,6 +43,7 @@ const quotePairs: ReadonlyArray<readonly [string, string]> = [
   ["【", "】"],
 ];
 const wordCharacter = /[\p{L}\p{N}]/u;
+const markdownMarkers = ["**", "__", "~~", "*", "_", "`"];
 
 export function validateTitle(raw: string, maxChars: number): string {
   if (!Number.isSafeInteger(maxChars) || maxChars <= 0) {
@@ -59,7 +60,9 @@ export function validateTitle(raw: string, maxChars: number): string {
     .filter((line) => line.length > 0)
     .join(" ");
 
-  for (let iteration = 0; iteration < 20; iteration += 1) {
+  const seenTitles = new Set<string>();
+  while (!seenTitles.has(title)) {
+    seenTitles.add(title);
     const previous = title;
     title = unwrapQuotes(title, protectedBackticks);
     title = stripLeadingMarkers(title);
@@ -77,7 +80,7 @@ export function validateTitle(raw: string, maxChars: number): string {
   title = restorePlaceholders(title, protectedUrls);
   title = restoreBackticks(title, protectedBackticks);
 
-  if (title.length === 0) {
+  if (title.length === 0 || /^[*_~`]+$/.test(title)) {
     throw TitleValidationError.empty();
   }
   if (Array.from(title).length > maxChars) {
@@ -128,11 +131,15 @@ function replaceMarkdownLinks(value: string): string {
 }
 
 function findClosingBracket(value: string, start: number): number {
+  let depth = 1;
   for (let index = start; index < value.length; index += 1) {
     if (value[index] === "\\") {
       index += 1;
+    } else if (value[index] === "[") {
+      depth += 1;
     } else if (value[index] === "]") {
-      return index;
+      depth -= 1;
+      if (depth === 0) return index;
     }
   }
   return -1;
@@ -154,7 +161,15 @@ function findClosingParenthesis(value: string, start: number): number {
 }
 
 function protectUrls(value: string, placeholders: string[]): string {
-  return value.replace(/https?:\/\/\S+/g, (url) => placeholder(placeholders, url));
+  return value.replace(/https?:\/\/\S+/g, (url, offset: number, input: string) => {
+    const marker = markdownMarkers.find(
+      (candidate) => input.slice(offset - candidate.length, offset) === candidate && url.endsWith(candidate),
+    );
+    if (marker) {
+      return `${placeholder(placeholders, url.slice(0, -marker.length))}${marker}`;
+    }
+    return placeholder(placeholders, url);
+  });
 }
 
 function stripEmphasis(value: string): string {
@@ -162,7 +177,7 @@ function stripEmphasis(value: string): string {
 
   let result = "";
   for (let index = 0; index < value.length; ) {
-    const marker = ["**", "__", "~~", "*", "_"].find((candidate) => value.startsWith(candidate, index));
+    const marker = markdownMarkers.slice(0, -1).find((candidate) => value.startsWith(candidate, index));
     if (!marker) {
       result += value[index];
       index += 1;
@@ -220,7 +235,7 @@ function stripInlineCode(value: string): string {
 
 function unwrapQuotes(value: string, protectedBackticks: string[]): string {
   for (const [opening, closing] of quotePairs) {
-    if (value.startsWith(opening) && value.endsWith(closing) && value.length > opening.length + closing.length) {
+    if (value.startsWith(opening) && value.endsWith(closing) && value.length >= opening.length + closing.length) {
       const inner = value.slice(opening.length, -closing.length).trim();
       return opening === "`"
         ? inner.replace(/`/g, (tick) => `\uE002${protectedBackticks.push(tick) - 1}\uE003`)

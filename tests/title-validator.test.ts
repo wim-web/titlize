@@ -35,6 +35,17 @@ describe("validateTitle", () => {
     expect(validateTitle("通常 `inline` code", 40)).toBe("通常 inline code");
   });
 
+  test.each(['""', "''", "``", "“”", "‘’", "「」", "『』", "【】"])(
+    "空の対応引用符を空タイトルとして拒否する: %s",
+    (raw) => {
+      expect(() => validateTitle(raw, 40)).toThrow(TitleValidationError);
+    },
+  );
+
+  test("任意に深い対応引用符をすべて剥がす", () => {
+    expect(validateTitle(`${"「".repeat(64)}認証${"」".repeat(64)}`, 40)).toBe("認証");
+  });
+
   test("単語内のunderscoreを保持し、強調マーカーだけを除去する", () => {
     expect(validateTitle("foo_bar_baz a__b__c", 40)).toBe("foo_bar_baz a__b__c");
     expect(validateTitle("**bold** __bold__ ~~strike~~ *em* _em_", 40)).toBe("bold bold strike em em");
@@ -46,9 +57,22 @@ describe("validateTitle", () => {
     );
   });
 
+  test("URLを囲むMarkdownだけを除去し、囲まれていないURL末尾記号は保持する", () => {
+    expect(validateTitle("**https://example.test/a_b**", 60)).toBe("https://example.test/a_b");
+    expect(validateTitle("~~https://example.test/a~~", 60)).toBe("https://example.test/a");
+    expect(validateTitle("See `https://example.test/a` now", 60)).toBe("See https://example.test/a now");
+    expect(validateTitle("https://example.test/a**?x=~ok~_`", 60)).toBe("https://example.test/a**?x=~ok~_`");
+  });
+
   test("括弧を含むリンク先でも表示テキストだけを保持する", () => {
     expect(validateTitle("[label](https://example.test/a_(b))", 40)).toBe("label");
     expect(validateTitle("![alt](https://example.test/a_(b))", 40)).toBe("alt");
+  });
+
+  test("入れ子とescapeを含むリンクラベルを保持する", () => {
+    expect(validateTitle("[a [b]](https://example.test)", 40)).toBe("a [b]");
+    expect(validateTitle("![a [b]](https://example.test)", 40)).toBe("a [b]");
+    expect(validateTitle("[a \\] b](https://example.test)", 40)).toBe("a \\] b");
   });
 
   test("空白付き情報文字列と4個以上のbacktick fenceを除去する", () => {
@@ -83,7 +107,7 @@ describe("validateTitle", () => {
   });
 
   test("空またはマークアップだけのタイトルを拒否する", () => {
-    for (const raw of ["", " \n\t ", "```\n```", "# ", "> ", "- ", "1. ", "**", "__", "~~"]) {
+    for (const raw of ["", " \n\t ", "```\n```", "# ", "> ", "- ", "1. ", "**", "__", "~~", "****", "____", "~~~~", "***", "___"]) {
       expect(() => validateTitle(raw, 40)).toThrow(TitleValidationError);
     }
   });
