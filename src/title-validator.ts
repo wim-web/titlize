@@ -45,14 +45,17 @@ const quotePairs: ReadonlyArray<readonly [string, string]> = [
 const wordCharacter = /[\p{L}\p{N}]/u;
 const markdownMarkers = ["**", "__", "~~", "*", "_", "`"];
 const urlWrapperMarkers = ["***", "___", "**", "__", "~~", "*", "_", "`"];
+const MAX_RAW_TITLE_CODE_UNITS = 4096;
 
 export function validateTitle(raw: string, maxChars: number): string {
   if (!Number.isSafeInteger(maxChars) || maxChars <= 0) {
     throw TitleValidationError.invalidMaxChars();
   }
+  if (raw.length > MAX_RAW_TITLE_CODE_UNITS) {
+    throw TitleValidationError.tooLong();
+  }
 
-  const protectedBackticks: string[] = [];
-  const protectedUrls: string[] = [];
+  const placeholders = new PlaceholderStore(raw);
   let title = raw
     .split(/\r\n|[\r\n]/)
     .map((line) => line.trim())
@@ -61,25 +64,25 @@ export function validateTitle(raw: string, maxChars: number): string {
     .filter((line) => line.length > 0)
     .join(" ");
 
-  const seenTitles = new Set<string>();
-  while (!seenTitles.has(title)) {
-    seenTitles.add(title);
+  let stabilized = false;
+  for (let pass = 0; pass <= raw.length; pass += 1) {
     const previous = title;
-    title = unwrapQuotes(title, protectedBackticks);
+    title = unwrapQuotes(title, placeholders);
     title = stripLeadingMarkers(title);
     title = replaceMarkdownLinks(title);
-    title = protectUrls(title, protectedUrls);
+    title = protectUrls(title, placeholders);
     title = stripEmphasis(title);
     title = stripInlineCode(title);
     title = collapseWhitespace(title);
 
     if (title === previous) {
+      stabilized = true;
       break;
     }
   }
+  if (!stabilized) throw TitleValidationError.tooLong();
 
-  title = restorePlaceholders(title, protectedUrls);
-  title = restoreBackticks(title, protectedBackticks);
+  title = placeholders.restore(title);
 
   if (title.length === 0 || /^[*_~]+$/.test(title)) {
     throw TitleValidationError.empty();
@@ -161,17 +164,17 @@ function findClosingParenthesis(value: string, start: number): number {
   return -1;
 }
 
-function protectUrls(value: string, placeholders: string[]): string {
-  return value.replace(/https?:\/\/[^\s"'“”‘’「」『』【】`]+/g, (url, offset: number, input: string) => {
+function protectUrls(value: string, placeholders: PlaceholderStore): string {
+  return value.replace(/https?:\/\/[^\s"“”‘’「」『』【】`]+/g, (url, offset: number, input: string) => {
     const expectedClosing = readOpeningMarkers(input, offset);
     if (expectedClosing) {
       const suffix = url.match(/[.,;:!?。、\)\]\}]+$/)?.[0] ?? "";
       const core = suffix ? url.slice(0, -suffix.length) : url;
       if (core.endsWith(expectedClosing)) {
-        return `${placeholder(placeholders, core.slice(0, -expectedClosing.length))}${expectedClosing}${suffix}`;
+        return `${placeholders.create("url", core.slice(0, -expectedClosing.length))}${expectedClosing}${suffix}`;
       }
     }
-    return placeholder(placeholders, url);
+    return placeholders.create("url", url);
   });
 }
 
@@ -198,7 +201,7 @@ function stripEmphasis(value: string): string {
       index += 1;
       continue;
     }
-    if (!isBoundaryBefore(value, index)) {
+    if (!isBoundaryBefore(value, index) || isEscaped(value, index) || isWhitespace(value[index + marker.length])) {
       result += marker;
       index += marker.length;
       continue;
@@ -217,7 +220,14 @@ function stripEmphasis(value: string): string {
 
 function findClosingMarker(value: string, marker: string, start: number): number {
   for (let index = start; index <= value.length - marker.length; index += 1) {
-    if (value.startsWith(marker, index) && isBoundaryAfter(value, index + marker.length)) return index;
+    if (
+      value.startsWith(marker, index) &&
+      !isEscaped(value, index) &&
+      !isWhitespace(value[index - 1]) &&
+      isBoundaryAfter(value, index + marker.length)
+    ) {
+      return index;
+    }
   }
   return -1;
 }
@@ -228,6 +238,16 @@ function isBoundaryBefore(value: string, index: number): boolean {
 
 function isBoundaryAfter(value: string, index: number): boolean {
   return index === value.length || !wordCharacter.test(value[index]);
+}
+
+function isWhitespace(value: string | undefined): boolean {
+  return value === undefined || /\s/.test(value);
+}
+
+function isEscaped(value: string, index: number): boolean {
+  let backslashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor -= 1) backslashes += 1;
+  return backslashes % 2 === 1;
 }
 
 function stripInlineCode(value: string): string {
@@ -248,28 +268,44 @@ function stripInlineCode(value: string): string {
   return result;
 }
 
-function unwrapQuotes(value: string, protectedBackticks: string[]): string {
-  for (const [opening, closing] of quotePairs) {
-    if (value.startsWith(opening) && value.endsWith(closing) && value.length >= opening.length + closing.length) {
-      const inner = value.slice(opening.length, -closing.length).trim();
-      return opening === "`"
-        ? inner.replace(/`/g, (tick) => `\uE002${protectedBackticks.push(tick) - 1}\uE003`)
-        : inner;
+function unwrapQuotes(value: string, placeholders: PlaceholderStore): string {
+  let result = value;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [opening, closing] of quotePairs) {
+      if (result.startsWith(opening) && result.endsWith(closing) && result.length >= opening.length + closing.length) {
+        const inner = result.slice(opening.length, -closing.length).trim();
+        result = opening === "`" ? inner.replace(/`/g, (tick) => placeholders.create("backtick", tick)) : inner;
+        changed = true;
+        break;
+      }
     }
   }
-  return value;
+  return result;
 }
 
-function placeholder(values: string[], value: string): string {
-  return `\uE000${values.push(value) - 1}\uE001`;
-}
+class PlaceholderStore {
+  private readonly tokens = new Map<string, string>();
+  private readonly namespace: string;
 
-function restorePlaceholders(value: string, values: string[]): string {
-  return value.replace(/\uE000(\d+)\uE001/g, (_, index: string) => values[Number(index)] ?? "");
-}
+  constructor(raw: string) {
+    let namespace = "\uE100";
+    while (raw.includes(namespace)) namespace += "\uE100";
+    this.namespace = namespace;
+  }
 
-function restoreBackticks(value: string, values: string[]): string {
-  return value.replace(/\uE002(\d+)\uE003/g, (_, index: string) => values[Number(index)] ?? "");
+  create(kind: "url" | "backtick", value: string): string {
+    const token = `${this.namespace}${kind}${this.tokens.size}${this.namespace}`;
+    this.tokens.set(token, value);
+    return token;
+  }
+
+  restore(value: string): string {
+    let result = value;
+    for (const [token, original] of this.tokens) result = result.split(token).join(original);
+    return result;
+  }
 }
 
 function collapseWhitespace(value: string): string {

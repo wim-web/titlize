@@ -6,6 +6,21 @@ describe("validateTitle", () => {
     expect(validateTitle("# 『認証エラーの修正』", 40)).toBe("認証エラーの修正");
   });
 
+  test("正規化前の入力が4096 code unitsを超える場合は上限を拒否する", () => {
+    expect(() => validateTitle("a".repeat(4097), Number.MAX_SAFE_INTEGER)).toThrow(TitleValidationError);
+    expect(validateTitle(`${"「".repeat(1000)}認証${"」".repeat(1000)}`, 40)).toBe("認証");
+    expect(() => validateTitle(`${"「".repeat(2048)}認証${"」".repeat(2048)}`, Number.MAX_SAFE_INTEGER)).toThrow(
+      TitleValidationError,
+    );
+  });
+
+  test("入力に含まれる旧placeholder文字列を変更しない", () => {
+    const url = "https://x.test";
+    expect(validateTitle("\uE0000\uE001", 40)).toBe("\uE0000\uE001");
+    expect(validateTitle(`\uE0000\uE001 ${url}`, 40)).toBe(`\uE0000\uE001 ${url}`);
+    expect(validateTitle("\uE0020\uE003", 40)).toBe("\uE0020\uE003");
+  });
+
   test("コードフェンスの行だけを除去し、中身を保持する", () => {
     expect(validateTitle("```\n認証エラーの修正\n```", 40)).toBe("認証エラーの修正");
     expect(validateTitle("```markdown\n# 認証エラーの修正\n```", 40)).toBe("認証エラーの修正");
@@ -51,10 +66,28 @@ describe("validateTitle", () => {
     expect(validateTitle("**bold** __bold__ ~~strike~~ *em* _em_", 40)).toBe("bold bold strike em em");
   });
 
+  test("演算子風・escape済みの強調記号を保持する", () => {
+    expect(validateTitle("2 * 3 * 4", 40)).toBe("2 * 3 * 4");
+    expect(validateTitle("foo ** bar ** baz", 40)).toBe("foo ** bar ** baz");
+    expect(validateTitle("\\*literal* \\_literal_", 40)).toBe("\\*literal* \\_literal_");
+  });
+
+  test("代表ケースの正規化は冪等である", () => {
+    const raw = '"# 『**[認証](https://example.test) エラー**』"';
+    const normalized = validateTitle(raw, 40);
+    expect(validateTitle(normalized, 40)).toBe(normalized);
+  });
+
   test("記号と括弧を含む生URLを一字も変更しない", () => {
     expect(validateTitle("https://example.test/a/**segment**?x=~ok~_(v)", 60)).toBe(
       "https://example.test/a/**segment**?x=~ok~_(v)",
     );
+  });
+
+  test("URL内部のapostrophe後にあるMarkdown風文字列を変更しない", () => {
+    expect(validateTitle("https://example.test/a'**b**", 60)).toBe("https://example.test/a'**b**");
+    expect(validateTitle("https://example.test/a'_b_", 60)).toBe("https://example.test/a'_b_");
+    expect(validateTitle("https://example.test/a'~~b~~", 60)).toBe("https://example.test/a'~~b~~");
   });
 
   test("URLを囲むMarkdownだけを除去し、囲まれていないURL末尾記号は保持する", () => {
