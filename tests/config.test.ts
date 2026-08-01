@@ -40,8 +40,16 @@ describe("loadConfig", () => {
 
   test("CODEX_HOME を状態パスのフォールバックに使う", () => {
     expect(loadConfig({ CODEX_HOME: "/tmp/codex-home" }).statePath).toBe(
-      "/tmp/codex-home/codex-title/state.sqlite3",
+      join("/tmp/codex-home", "codex-title", "state.sqlite3"),
     );
+  });
+
+  test.each([
+    ["CODEX_TITLE_EVERY", "every"],
+    ["CODEX_TITLE_MAX_CHARS", "maxChars"],
+    ["CODEX_TITLE_TIMEOUT_MS", "timeoutMs"],
+  ] as const)("%s は安全な最大整数を受け入れる", (name, property) => {
+    expect(loadConfig({ [name]: "9007199254740991" })[property]).toBe(9007199254740991);
   });
 
   test.each([
@@ -51,6 +59,7 @@ describe("loadConfig", () => {
     ["CODEX_TITLE_EVERY", "1.5"],
     ["CODEX_TITLE_EVERY", "3x"],
     ["CODEX_TITLE_EVERY", "Infinity"],
+    ["CODEX_TITLE_EVERY", "9007199254740992"],
     ["CODEX_TITLE_EVERY", "999999999999999999999999999999999999999999999999999"],
     ["CODEX_TITLE_EVERY", " 3"],
     ["CODEX_TITLE_EVERY", "3 "],
@@ -60,6 +69,7 @@ describe("loadConfig", () => {
     ["CODEX_TITLE_MAX_CHARS", "1.5"],
     ["CODEX_TITLE_MAX_CHARS", "3x"],
     ["CODEX_TITLE_MAX_CHARS", "Infinity"],
+    ["CODEX_TITLE_MAX_CHARS", "9007199254740992"],
     ["CODEX_TITLE_MAX_CHARS", "999999999999999999999999999999999999999999999999999"],
     ["CODEX_TITLE_MAX_CHARS", " 3"],
     ["CODEX_TITLE_MAX_CHARS", "3 "],
@@ -69,6 +79,7 @@ describe("loadConfig", () => {
     ["CODEX_TITLE_TIMEOUT_MS", "1.5"],
     ["CODEX_TITLE_TIMEOUT_MS", "3x"],
     ["CODEX_TITLE_TIMEOUT_MS", "Infinity"],
+    ["CODEX_TITLE_TIMEOUT_MS", "9007199254740992"],
     ["CODEX_TITLE_TIMEOUT_MS", "999999999999999999999999999999999999999999999999999"],
     ["CODEX_TITLE_TIMEOUT_MS", " 3"],
     ["CODEX_TITLE_TIMEOUT_MS", "3 "],
