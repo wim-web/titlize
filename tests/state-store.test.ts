@@ -435,6 +435,33 @@ describe("StateStore", () => {
     expect(() => store.getSession("s1")).toThrow();
     expect(() => store.markPending("s1", "now")).toThrow();
   });
+
+  test("read-only DBでPRAGMA初期化が失敗しても接続を閉じ元のエラーを保つ", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "titlize-state-readonly-")), "state.sqlite3");
+    const setup = new Database(path);
+    setup.exec("CREATE TABLE marker (id INTEGER)");
+    setup.close();
+    let opened: Database | undefined;
+    let failure: unknown;
+
+    try {
+      new StateStore(path, {
+        openDatabase(databasePath) {
+          opened = new Database(databasePath, { readonly: true });
+          return opened;
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(String(failure)).toContain("readonly");
+    const openedDatabase = opened;
+    expect(openedDatabase).toBeDefined();
+    if (openedDatabase === undefined) throw new Error("test database was not opened");
+    expect(() => openedDatabase.query("SELECT 1").get()).toThrow();
+  });
 });
 
 describe("shouldUpdate", () => {

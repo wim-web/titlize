@@ -56,23 +56,27 @@ function toSessionState(row: SessionRow): SessionState {
   };
 }
 
+export interface StateStoreOptions {
+  openDatabase?: (path: string) => Database;
+}
+
 export class StateStore {
   private readonly db: Database;
 
-  constructor(path: string) {
+  constructor(path: string, options: StateStoreOptions = {}) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-    this.db = new Database(path);
-    this.db.exec("PRAGMA busy_timeout = 5000");
-    this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec("PRAGMA foreign_keys = ON");
+    this.db = (options.openDatabase ?? ((databasePath) => new Database(databasePath)))(path);
     try {
+      this.db.exec("PRAGMA busy_timeout = 5000");
+      this.db.exec("PRAGMA journal_mode = WAL");
+      this.db.exec("PRAGMA foreign_keys = ON");
       this.db.exec(schema);
       this.migrateTitleIntentColumns();
     } catch (error) {
       try {
         this.db.close();
       } catch {
-        // Preserve the schema or migration failure.
+        // Preserve the original PRAGMA, schema, or migration failure.
       }
       throw error;
     }

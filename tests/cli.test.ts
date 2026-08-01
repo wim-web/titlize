@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { loadConfig } from "../src/config";
+import { loadConfig, MAX_TITLE_TIMEOUT_MS } from "../src/config";
 import {
   CliError,
   composeRuntime,
@@ -597,5 +597,17 @@ describe("direct CLI", () => {
     expect(stdout).toBe("{}\n");
     expect(stderr).not.toContain("malformed-secret");
     expect(isAbsolute(statePath)).toBe(true);
+  });
+});
+
+describe("repo-local Hook timeout", () => {
+  test("内部4操作の最大timeoutに30秒のcleanup余裕を加える", async () => {
+    const hookConfig = (await Bun.file(join(import.meta.dir, "..", ".codex", "hooks.json")).json()) as {
+      hooks: { Stop: Array<{ hooks: Array<{ timeout: number }> }> };
+    };
+    const timeoutSeconds = hookConfig.hooks.Stop[0]?.hooks[0]?.timeout;
+
+    expect(timeoutSeconds).toBe(150);
+    expect(timeoutSeconds * 1000 - 4 * MAX_TITLE_TIMEOUT_MS).toBeGreaterThanOrEqual(30000);
   });
 });

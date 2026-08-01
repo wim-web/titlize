@@ -2,22 +2,29 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TitleConfig } from "./types";
 
+export const MAX_TITLE_TIMEOUT_MS = 30000;
+
 const DEFAULTS = {
   every: 3,
   provider: "codex",
   model: "gpt-5.6-luna",
   maxChars: 40,
-  timeoutMs: 30000,
+  timeoutMs: MAX_TITLE_TIMEOUT_MS,
   appServer: "stdio://",
 } as const;
 
-function positiveInteger(value: string | undefined, name: string, fallback: number): number {
+function positiveInteger(
+  value: string | undefined,
+  name: string,
+  fallback: number,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number {
   if (value === undefined) {
     return fallback;
   }
 
   const parsed = Number(value);
-  if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(parsed)) {
+  if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(parsed) || parsed > maximum) {
     throw new Error(`Invalid ${name}`);
   }
 
@@ -68,6 +75,7 @@ export function loadConfig(env: Record<string, string | undefined>): TitleConfig
       env.CODEX_TITLE_TIMEOUT_MS,
       "CODEX_TITLE_TIMEOUT_MS",
       DEFAULTS.timeoutMs,
+      MAX_TITLE_TIMEOUT_MS,
     ),
     statePath,
     appServer,

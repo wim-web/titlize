@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../src/config";
+import { loadConfig, MAX_TITLE_TIMEOUT_MS } from "../src/config";
 
 describe("loadConfig", () => {
   test("環境変数がない場合は既定値を返す", () => {
@@ -47,9 +47,18 @@ describe("loadConfig", () => {
   test.each([
     ["CODEX_TITLE_EVERY", "every"],
     ["CODEX_TITLE_MAX_CHARS", "maxChars"],
-    ["CODEX_TITLE_TIMEOUT_MS", "timeoutMs"],
   ] as const)("%s は安全な最大整数を受け入れる", (name, property) => {
     expect(loadConfig({ [name]: "9007199254740991" })[property]).toBe(9007199254740991);
+  });
+
+  test("CODEX_TITLE_TIMEOUT_MS は既定値30000を上限として受け入れる", () => {
+    expect(MAX_TITLE_TIMEOUT_MS).toBe(30000);
+    expect(loadConfig({ CODEX_TITLE_TIMEOUT_MS: String(MAX_TITLE_TIMEOUT_MS) }).timeoutMs).toBe(
+      MAX_TITLE_TIMEOUT_MS,
+    );
+    expect(() =>
+      loadConfig({ CODEX_TITLE_TIMEOUT_MS: String(MAX_TITLE_TIMEOUT_MS + 1) }),
+    ).toThrow("CODEX_TITLE_TIMEOUT_MS");
   });
 
   test.each([
@@ -79,11 +88,12 @@ describe("loadConfig", () => {
     ["CODEX_TITLE_TIMEOUT_MS", "1.5"],
     ["CODEX_TITLE_TIMEOUT_MS", "3x"],
     ["CODEX_TITLE_TIMEOUT_MS", "Infinity"],
+    ["CODEX_TITLE_TIMEOUT_MS", "30001"],
     ["CODEX_TITLE_TIMEOUT_MS", "9007199254740992"],
     ["CODEX_TITLE_TIMEOUT_MS", "999999999999999999999999999999999999999999999999999"],
     ["CODEX_TITLE_TIMEOUT_MS", " 3"],
     ["CODEX_TITLE_TIMEOUT_MS", "3 "],
-  ])("%s は正の10進整数だけを受け入れる: %s", (name, value) => {
+  ])("%s は許容範囲内の正の10進整数だけを受け入れる: %s", (name, value) => {
     expect(() => loadConfig({ [name]: value })).toThrow(name);
   });
 
