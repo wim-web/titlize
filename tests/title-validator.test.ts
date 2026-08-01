@@ -104,6 +104,13 @@ describe("validateTitle", () => {
     expect(validateTitle("https://example.test/a'**b**", 200)).toBe("https://example.test/a'**b**");
   });
 
+  test.each(["foo**'https://x.test'**", "\\**'https://x.test'**", "a_'https://x.test'_", "x~~'https://x.test'~~"])(
+    "無効な強調境界ではapostrophe付きURLを文字どおり保持する: %s",
+    (raw) => {
+      expect(validateTitle(raw, 200)).toBe(raw);
+    },
+  );
+
   test("PUAを多く含む入力とURLを衝突なく正規化する", () => {
     const pua = "\uE100";
     const raw = `${pua}https://x.test ${pua}https://x.test`;

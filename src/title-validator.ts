@@ -169,7 +169,19 @@ function protectUrls(value: string, placeholders: PlaceholderStore): string {
     const suffix = url.match(/[.,;:!?。、\)\]\}]+$/)?.[0] ?? "";
     const core = suffix ? url.slice(0, -suffix.length) : url;
     const quotedOpening = readOpeningMarkers(input, offset);
-    if (url.startsWith("'") && quotedOpening && core.endsWith(`'${quotedOpening}`)) {
+    const openingStart = offset - quotedOpening.length;
+    const closingStart = offset + core.length - quotedOpening.length;
+    const openingMarker = urlWrapperMarkers.find((marker) => marker !== "`" && input.startsWith(marker, openingStart));
+    const closingMarker = urlWrapperMarkers.find((marker) => marker !== "`" && input.startsWith(marker, closingStart));
+    if (
+      url.startsWith("'") &&
+      quotedOpening &&
+      core.endsWith(`'${quotedOpening}`) &&
+      openingMarker &&
+      closingMarker &&
+      isValidEmphasisOpening(input, openingStart, openingMarker) &&
+      isValidEmphasisClosing(input, closingStart, closingMarker)
+    ) {
       return `${placeholders.create(core.slice(1, -quotedOpening.length - 1))}${quotedOpening}${suffix}`;
     }
     const expectedClosing = readOpeningMarkers(input, offset);
@@ -205,7 +217,7 @@ function stripEmphasis(value: string): string {
       index += 1;
       continue;
     }
-    if (!isBoundaryBefore(value, index) || isEscaped(value, index) || isWhitespace(value[index + marker.length])) {
+    if (!isValidEmphasisOpening(value, index, marker)) {
       result += marker;
       index += marker.length;
       continue;
@@ -224,12 +236,7 @@ function stripEmphasis(value: string): string {
 
 function findClosingMarker(value: string, marker: string, start: number): number {
   for (let index = start; index <= value.length - marker.length; index += 1) {
-    if (
-      value.startsWith(marker, index) &&
-      !isEscaped(value, index) &&
-      !isWhitespace(value[index - 1]) &&
-      isBoundaryAfter(value, index + marker.length)
-    ) {
+    if (value.startsWith(marker, index) && isValidEmphasisClosing(value, index, marker)) {
       return index;
     }
   }
@@ -242,6 +249,14 @@ function isBoundaryBefore(value: string, index: number): boolean {
 
 function isBoundaryAfter(value: string, index: number): boolean {
   return index === value.length || !wordCharacter.test(value[index]);
+}
+
+function isValidEmphasisOpening(value: string, index: number, marker: string): boolean {
+  return isBoundaryBefore(value, index) && !isEscaped(value, index) && !isWhitespace(value[index + marker.length]);
+}
+
+function isValidEmphasisClosing(value: string, index: number, marker: string): boolean {
+  return !isEscaped(value, index) && !isWhitespace(value[index - 1]) && isBoundaryAfter(value, index + marker.length);
 }
 
 function isWhitespace(value: string | undefined): boolean {
