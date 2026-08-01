@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import {
   type AppServerTransportFactory,
   type TransportOpenOptions,
 } from "../src/app-server-client";
+import { registerActiveProcessTree } from "../src/codex-title-provider";
 
 const initializeResult = {
   userAgent: "codex_cli_rs/0.145.0",
@@ -206,6 +208,26 @@ describe("AppServerClient protocol", () => {
     expect(performance.now() - startedAt).toBeLessThan(500);
   });
 
+  test("timeout後に遅れてopenしたtransportも非同期で閉じる", async () => {
+    let resolveOpen!: (transport: AppServerTransport) => void;
+    const transport = new FakeTransport([]);
+    const factory: AppServerTransportFactory = {
+      open: async () =>
+        await new Promise<AppServerTransport>((resolve) => {
+          resolveOpen = resolve;
+        }),
+    };
+    const client = new AppServerClient({ timeoutMs: 15, transportFactory: factory });
+
+    await expect(
+      client.call("thread/read", { threadId: "session-1", includeTurns: false }),
+    ).rejects.toThrow("app server request timed out");
+    resolveOpen(transport);
+
+    expect(await waitForCondition(() => transport.cleanupFinished, 500)).toBe(true);
+    expect(transport.closeCalls).toBe(1);
+  });
+
   test("stdin write待機にもoperation timeoutを適用してcleanupする", async () => {
     let closeCalls = 0;
     const transport: AppServerTransport = {
@@ -349,6 +371,41 @@ describe("StdioAppServerTransportFactory", () => {
   });
 
   test.each([
+    ["crlf", "helper-title"],
+    ["eof-no-newline", "helper-title"],
+    ["split-utf8", "日本語タイトル"],
+  ] as const)("%s JSONL境界を正常に処理する", async (mode, expectedTitle) => {
+    const client = new AppServerClient({
+      timeoutMs: 2_000,
+      transportFactory: new StdioAppServerTransportFactory({
+        command: process.execPath,
+        args: [helperPath, mode],
+      }),
+    });
+
+    await expect(
+      client.call("thread/read", { threadId: "session-1", includeTurns: false }),
+    ).resolves.toEqual({ thread: { name: expectedTitle } });
+  });
+
+  test("不正UTF-8 JSONLを本文なしのprotocol errorへ変換する", async () => {
+    const client = new AppServerClient({
+      timeoutMs: 1_000,
+      transportFactory: new StdioAppServerTransportFactory({
+        command: process.execPath,
+        args: [helperPath, "invalid-utf8"],
+      }),
+    });
+
+    const rejection = client.call("thread/read", {
+      threadId: "utf8-secret",
+      includeTurns: false,
+    });
+    await expect(rejection).rejects.toThrow("app server returned an invalid response");
+    await expect(rejection).rejects.not.toThrow(/utf8-secret/);
+  });
+
+  test.each([
     ["malformed", "app server returned an invalid response", 256, 4_096, 32],
     ["oversize-line", "app server output exceeded the safety limit", 128, 4_096, 32],
     ["oversize-total", "app server output exceeded the safety limit", 256, 512, 32],
@@ -415,6 +472,99 @@ describe("StdioAppServerTransportFactory", () => {
       await rm(temporaryDirectory, { recursive: true, force: true });
     }
   });
+
+  test("通常closeで共有lifecycle registryを一度だけ解除する", async () => {
+    const signals = ["exit", "SIGINT", "SIGTERM", "SIGHUP"] as const;
+    const before = Object.fromEntries(signals.map((signal) => [signal, process.listenerCount(signal)]));
+    let registrations = 0;
+    let unregistrations = 0;
+    const client = new AppServerClient({
+      timeoutMs: 1_000,
+      transportFactory: new StdioAppServerTransportFactory({
+        command: process.execPath,
+        args: [helperPath, "happy"],
+        registerProcessTree: (treeKiller) => {
+          registrations += 1;
+          const unregister = registerActiveProcessTree(treeKiller);
+          return () => {
+            unregistrations += 1;
+            unregister();
+          };
+        },
+      }),
+    });
+
+    await client.call("thread/read", { threadId: "session-1", includeTurns: false });
+
+    expect(registrations).toBe(1);
+    expect(unregistrations).toBe(1);
+    for (const signal of signals) expect(process.listenerCount(signal)).toBe(before[signal]);
+  });
+
+  test("registry登録失敗時はspawn済みprocess treeとstdioを回収する", async () => {
+    if (process.platform === "win32") return;
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-app-server-register-"));
+    const pidFile = join(temporaryDirectory, "tree.json");
+    const client = new AppServerClient({
+      timeoutMs: 2_000,
+      transportFactory: new StdioAppServerTransportFactory({
+        command: process.execPath,
+        args: [helperPath, "eager-tree", pidFile],
+        registerProcessTree: () => {
+          const deadline = performance.now() + 500;
+          while (!existsSync(pidFile) && performance.now() < deadline) Bun.sleepSync(5);
+          throw new Error("registry-secret /private/sensitive/path");
+        },
+      }),
+    });
+
+    try {
+      const rejection = client.call("thread/read", {
+        threadId: "session-secret",
+        includeTurns: false,
+      });
+      await expect(rejection).rejects.toThrow("app server could not start");
+      await expect(rejection).rejects.not.toThrow(/registry-secret|session-secret|private/);
+
+      const pids = await waitForTreePids(pidFile, 500);
+      expect(await waitForProcessExit(pids.childPid, 1_000)).toBe(true);
+      expect(await waitForProcessExit(pids.grandchildPid, 1_000)).toBe(true);
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("親SIGTERMでactive App Serverの子孫processを同期回収する", async () => {
+    if (process.platform === "win32") return;
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-app-server-signal-"));
+    const pidFile = join(temporaryDirectory, "tree.json");
+    const lifecycleWorker = join(import.meta.dir, "helpers", "app-server-lifecycle-worker.ts");
+    const wrapper = Bun.spawn([process.execPath, lifecycleWorker, helperPath, pidFile], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    let pids: { childPid: number; grandchildPid: number } | undefined;
+
+    try {
+      pids = await waitForTreePids(pidFile, 2_000);
+      process.kill(wrapper.pid, "SIGTERM");
+      expect(await waitForPromise(wrapper.exited, 1_000)).toBe(true);
+      expect(await waitForProcessExit(pids.childPid, 1_000)).toBe(true);
+      expect(await waitForProcessExit(pids.grandchildPid, 1_000)).toBe(true);
+    } finally {
+      try {
+        wrapper.kill("SIGKILL");
+      } catch {
+        // The wrapper may already be gone.
+      }
+      if (pids) {
+        killPid(pids.childPid);
+        killPid(pids.grandchildPid);
+      }
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
 });
 
 async function waitForTreePids(
@@ -447,4 +597,25 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
     await Bun.sleep(10);
   }
   return false;
+}
+
+async function waitForCondition(condition: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (condition()) return true;
+    await Bun.sleep(5);
+  }
+  return condition();
+}
+
+async function waitForPromise<T>(promise: Promise<T>, timeoutMs: number): Promise<boolean> {
+  return await Promise.race([promise.then(() => true), Bun.sleep(timeoutMs).then(() => false)]);
+}
+
+function killPid(pid: number): void {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // The process already exited.
+  }
 }

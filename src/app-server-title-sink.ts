@@ -15,10 +15,14 @@ export class AppServerTitleSink {
       const threadId = validateThreadId(sessionId);
       const result = await this.client.call("thread/read", { threadId, includeTurns: false });
       const thread = readThread(result);
-      if (!Object.hasOwn(thread, "name") || (typeof thread.name !== "string" && thread.name !== null)) {
+      if (
+        Object.hasOwn(thread, "name") &&
+        typeof thread.name !== "string" &&
+        thread.name !== null
+      ) {
         throw AppServerError.protocolError();
       }
-      return thread.name ?? undefined;
+      return typeof thread.name === "string" ? thread.name : undefined;
     } catch (error) {
       throw safeSinkError(error);
     }

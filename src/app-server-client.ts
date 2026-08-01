@@ -1,4 +1,4 @@
-import { createProcessTreeKiller } from "./codex-title-provider";
+import { createProcessTreeKiller, registerActiveProcessTree } from "./codex-title-provider";
 
 const CLIENT_VERSION = "0.1.0";
 const MAX_THREAD_ID_CODE_UNITS = 4_096;
@@ -11,7 +11,7 @@ const DEFAULT_MAX_QUEUED_MESSAGES = 256;
 const MAX_CONFIGURED_OUTPUT_BYTES = 128 * 1024 * 1024;
 const MAX_CONFIGURED_QUEUE_MESSAGES = 4_096;
 const CLEANUP_GRACE_MS = 100;
-const CLIENT_CLEANUP_GRACE_MS = 200;
+const CLIENT_CLEANUP_GRACE_MS = 300;
 
 type AppServerErrorReason =
   | "invalidRequest"
@@ -129,15 +129,16 @@ export class AppServerClient implements AppServerRpcClient {
       controller.abort();
     }, this.timeoutMs);
     let transport: AppServerTransport | undefined;
+    let openPromise: Promise<AppServerTransport> | undefined;
     let result: unknown;
     let failure: AppServerError | undefined;
     let opened = false;
 
     try {
-      transport = await raceWithSignal(
+      openPromise = Promise.resolve().then(() =>
         this.transportFactory.open({ signal: controller.signal }),
-        controller.signal,
       );
+      transport = await raceWithSignal(openPromise, controller.signal);
       opened = true;
       await raceWithSignal(transport.writeLine(lines.initialize), controller.signal);
       const initializeResponse = await waitForResponse(transport, 1, controller.signal);
@@ -149,6 +150,8 @@ export class AppServerClient implements AppServerRpcClient {
     } catch (error) {
       failure = normalizeClientError(error, timedOut, opened);
     }
+
+    if (!transport && openPromise) closeTransportIfItOpensLate(openPromise, controller.signal);
 
     if (transport) {
       const closeError = await closeBeforeReturn(transport, controller.signal);
@@ -330,6 +333,21 @@ function resolveOnAbort(signal: AbortSignal): Promise<typeof CLOSE_ABORTED> {
   });
 }
 
+function closeTransportIfItOpensLate(
+  openPromise: Promise<AppServerTransport>,
+  signal: AbortSignal,
+): void {
+  void openPromise.then(
+    async (lateTransport) => {
+      // A timed-out factory must not be able to orphan a transport by resolving after call().
+      await closeBeforeReturn(lateTransport, signal);
+    },
+    () => {
+      // The original call already converted the open failure to a fixed AppServerError.
+    },
+  );
+}
+
 function isPositiveSafeTimeout(value: unknown): value is number {
   return (
     typeof value === "number" &&
@@ -357,6 +375,7 @@ export interface StdioAppServerTransportFactoryOptions {
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
   maxQueuedMessages?: number;
+  registerProcessTree?: (treeKiller: () => void) => () => void;
 }
 
 interface StdioLimits {
@@ -370,6 +389,7 @@ export class StdioAppServerTransportFactory implements AppServerTransportFactory
   private readonly command: string;
   private readonly args: readonly string[];
   private readonly limits: StdioLimits;
+  private readonly registerProcessTree: (treeKiller: () => void) => () => void;
 
   constructor(options: StdioAppServerTransportFactoryOptions = {}) {
     this.command = options.command ?? "codex";
@@ -380,6 +400,7 @@ export class StdioAppServerTransportFactory implements AppServerTransportFactory
       maxStderrBytes: options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES,
       maxQueuedMessages: options.maxQueuedMessages ?? DEFAULT_MAX_QUEUED_MESSAGES,
     };
+    this.registerProcessTree = options.registerProcessTree ?? registerActiveProcessTree;
   }
 
   async open(options: TransportOpenOptions): Promise<AppServerTransport> {
@@ -392,7 +413,39 @@ export class StdioAppServerTransportFactory implements AppServerTransportFactory
         stdout: "pipe",
         stderr: "pipe",
       });
-      const transport = new StdioAppServerTransport(subprocess, options.signal, this.limits);
+      const killProcessTree = createProcessTreeKiller({
+        pid: subprocess.pid,
+        directKill: () => subprocess.kill("SIGKILL"),
+      });
+      let unregisterProcessTree: () => void;
+      try {
+        unregisterProcessTree = this.registerProcessTree(killProcessTree);
+        if (typeof unregisterProcessTree !== "function") throw AppServerError.startFailed();
+      } catch {
+        killProcessTree();
+        await cleanupUnregisteredProcess(subprocess, killProcessTree);
+        throw AppServerError.startFailed();
+      }
+
+      let transport: StdioAppServerTransport;
+      try {
+        transport = new StdioAppServerTransport(
+          subprocess,
+          options.signal,
+          this.limits,
+          killProcessTree,
+          unregisterProcessTree,
+        );
+      } catch {
+        try {
+          unregisterProcessTree();
+        } catch {
+          // Registration cleanup must not expose callback details.
+        }
+        killProcessTree();
+        await cleanupUnregisteredProcess(subprocess, killProcessTree);
+        throw AppServerError.startFailed();
+      }
       if (options.signal.aborted) {
         await transport.close();
         throw AppServerError.timedOut();
@@ -414,9 +467,9 @@ class StdioAppServerTransport implements AppServerTransport {
   private readonly queue: unknown[] = [];
   private waiter: MessageWaiter | undefined;
   private terminalError: AppServerError | undefined;
+  private endOfStreamError: AppServerError | undefined;
   private closing = false;
   private closed = false;
-  private readonly killProcessTree: () => void;
   private readonly stdoutReader: ReadableStreamDefaultReader<Uint8Array>;
   private readonly stderrReader: ReadableStreamDefaultReader<Uint8Array>;
   private readonly stdoutTask: Promise<void>;
@@ -431,11 +484,9 @@ class StdioAppServerTransport implements AppServerTransport {
     private readonly subprocess: Bun.PipedSubprocess,
     private readonly signal: AbortSignal,
     private readonly limits: StdioLimits,
+    private readonly killProcessTree: () => void,
+    private readonly unregisterProcessTree: () => void,
   ) {
-    this.killProcessTree = createProcessTreeKiller({
-      pid: subprocess.pid,
-      directKill: () => subprocess.kill("SIGKILL"),
-    });
     this.stdoutReader = subprocess.stdout.getReader();
     this.stderrReader = subprocess.stderr.getReader();
     this.signal.addEventListener("abort", this.onAbort, { once: true });
@@ -475,6 +526,7 @@ class StdioAppServerTransport implements AppServerTransport {
   async readMessage(): Promise<unknown> {
     if (this.terminalError) throw this.terminalError;
     if (this.queue.length > 0) return this.queue.shift();
+    if (this.endOfStreamError) throw this.endOfStreamError;
     if (this.waiter) throw AppServerError.protocolError();
     return await new Promise<unknown>((resolve, reject) => {
       this.waiter = { resolve, reject };
@@ -506,7 +558,16 @@ class StdioAppServerTransport implements AppServerTransport {
       if (this.subprocess.exitCode === null) this.killProcessTree();
       this.cancelReaders();
       await waitForCleanup([endPromise, this.stdoutTask, this.stderrTask, this.exitTask]);
+      if (this.subprocess.exitCode === null) {
+        this.killProcessTree();
+        await waitForCleanup([this.stdoutTask, this.stderrTask, this.exitTask]);
+      }
       this.signal.removeEventListener("abort", this.onAbort);
+      try {
+        this.unregisterProcessTree();
+      } catch {
+        // Lifecycle cleanup errors are intentionally hidden from callers.
+      }
       this.closed = true;
     }
 
@@ -560,7 +621,10 @@ class StdioAppServerTransport implements AppServerTransport {
       if (lineBytes > 0) this.acceptLine(takeLine(), decoder);
       if (!this.closing && !this.terminalError) {
         const exitCode = await this.exitTask;
-        this.fail(exitCode === 0 ? AppServerError.protocolError() : AppServerError.processFailed());
+        const error =
+          exitCode === 0 ? AppServerError.protocolError() : AppServerError.processFailed();
+        if (exitCode !== 0) this.fail(error);
+        else this.finishStdout(error);
       }
     } finally {
       this.stdoutReader.releaseLock();
@@ -612,6 +676,13 @@ class StdioAppServerTransport implements AppServerTransport {
     this.queue.push(message);
   }
 
+  private finishStdout(error: AppServerError): void {
+    this.endOfStreamError = error;
+    const waiter = this.waiter;
+    this.waiter = undefined;
+    waiter?.reject(error);
+  }
+
   private fail(error: AppServerError): void {
     if (this.terminalError) return;
     this.terminalError = error;
@@ -631,6 +702,24 @@ class StdioAppServerTransport implements AppServerTransport {
   private cancelReaders(): void {
     void this.stdoutReader.cancel().catch(() => {});
     void this.stderrReader.cancel().catch(() => {});
+  }
+}
+
+async function cleanupUnregisteredProcess(
+  subprocess: Bun.PipedSubprocess,
+  killProcessTree: () => void,
+): Promise<void> {
+  const cleanupTasks: Promise<unknown>[] = [
+    Promise.resolve().then(() => subprocess.stdin.end()),
+    Promise.resolve().then(() => subprocess.stdout.cancel()),
+    Promise.resolve().then(() => subprocess.stderr.cancel()),
+    subprocess.exited,
+  ];
+  for (const task of cleanupTasks) void task.catch(() => {});
+  await waitForCleanup(cleanupTasks);
+  if (subprocess.exitCode === null) {
+    killProcessTree();
+    await waitForCleanup(cleanupTasks);
   }
 }
 

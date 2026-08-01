@@ -14,6 +14,8 @@ if (mode === "nonzero") {
 const reader = Bun.stdin.stream().getReader();
 const decoder = new TextDecoder();
 
+if (mode === "eager-tree") await startProcessTree();
+
 while (true) {
   const { done, value } = await reader.read();
   if (done) break;
@@ -39,6 +41,10 @@ async function handleLine(line: string): Promise<void> {
     }
     if (mode === "malformed") {
       process.stdout.write("{worker-secret malformed\n");
+      return;
+    }
+    if (mode === "invalid-utf8") {
+      process.stdout.write(Uint8Array.from([0xff, 0x0a]));
       return;
     }
     if (mode === "oversize-line") {
@@ -76,7 +82,7 @@ async function handleLine(line: string): Promise<void> {
       process.stdout.write(`${lines.map((value) => JSON.stringify(value)).join("\n")}\n`);
       return;
     }
-    process.stdout.write(`${JSON.stringify({
+    const initializeLine = JSON.stringify({
       id: 1,
       result: {
         userAgent: "helper/1",
@@ -84,7 +90,8 @@ async function handleLine(line: string): Promise<void> {
         platformFamily: "unix",
         platformOs: "test",
       },
-    })}\n`);
+    });
+    process.stdout.write(`${initializeLine}${mode === "crlf" ? "\r\n" : "\n"}`);
     return;
   }
 
@@ -97,22 +104,48 @@ async function handleLine(line: string): Promise<void> {
     if (!initialized) process.exit(9);
     targetHandled = true;
     if (mode === "timeout-tree") {
-      const grandchild = Bun.spawn([process.execPath, "-e", "await Bun.sleep(60_000)"], {
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      if (pidFile) {
-        await writeFile(
-          pidFile,
-          JSON.stringify({ childPid: process.pid, grandchildPid: grandchild.pid }),
-          "utf8",
-        );
-      }
+      await startProcessTree();
       await new Promise<never>(() => {});
     }
-    process.stdout.write(`${JSON.stringify({ id: 2, result: { thread: { name: "helper-title" } } })}\n`);
+    const title = mode === "split-utf8" ? "日本語タイトル" : "helper-title";
+    const response = Buffer.from(JSON.stringify({ id: 2, result: { thread: { name: title } } }));
+    if (mode === "eof-no-newline") {
+      await writeOutput(response);
+      process.exit(0);
+    }
+    if (mode === "split-utf8") {
+      const firstMultibyte = response.findIndex((byte) => byte >= 0x80);
+      await writeOutput(response.subarray(0, firstMultibyte + 1));
+      await Bun.sleep(5);
+      await writeOutput(Buffer.concat([response.subarray(firstMultibyte + 1), Buffer.from("\n")]));
+      return;
+    }
+    process.stdout.write(`${response.toString("utf8")}${mode === "crlf" ? "\r\n" : "\n"}`);
   }
 }
 
 if (targetHandled) process.exit(0);
+
+async function startProcessTree(): Promise<void> {
+  const grandchild = Bun.spawn([process.execPath, "-e", "await Bun.sleep(60_000)"], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  if (pidFile) {
+    await writeFile(
+      pidFile,
+      JSON.stringify({ childPid: process.pid, grandchildPid: grandchild.pid }),
+      "utf8",
+    );
+  }
+}
+
+async function writeOutput(value: Uint8Array): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    process.stdout.write(value, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}

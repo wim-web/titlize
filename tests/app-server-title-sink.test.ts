@@ -73,7 +73,6 @@ describe("AppServerTitleSink", () => {
     ["missing response", {}],
     ["missing thread", { other: {} }],
     ["non-object thread", { thread: "response-secret" }],
-    ["missing name", { thread: { turns: [] } }],
     ["invalid name", { thread: { name: 42, turns: [] } }],
   ])("readTitleの壊れたschemaを安全に拒否する: %s", async (_name, result) => {
     const sink = new AppServerTitleSink(new FakeRpcClient([result]));
@@ -82,6 +81,13 @@ describe("AppServerTitleSink", () => {
     await expect(rejection).rejects.toBeInstanceOf(AppServerError);
     await expect(rejection).rejects.toThrow("app server returned an invalid response");
     await expect(rejection).rejects.not.toThrow(/response-secret/);
+  });
+
+  test("readTitleはoptionalなname欠落をundefinedとして扱う", async () => {
+    const client = new FakeRpcClient([{ thread: { id: "s1", turns: [] } }]);
+    const sink = new AppServerTitleSink(client);
+
+    await expect(sink.readTitle("s1")).resolves.toBeUndefined();
   });
 
   test.each([

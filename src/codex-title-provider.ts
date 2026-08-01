@@ -268,6 +268,10 @@ class ActiveProcessTreeRegistry {
 // cleanup of any detached process group that the operating system leaves behind.
 const activeProcessTrees = new ActiveProcessTreeRegistry();
 
+export function registerActiveProcessTree(treeKiller: () => void): () => void {
+  return activeProcessTrees.register(treeKiller);
+}
+
 export interface TemporaryWorkspace {
   readonly cwd: string;
   cleanup(): Promise<void>;
@@ -388,7 +392,7 @@ export class BunCommandRunner implements CommandRunner {
 
     let unregisterProcessTree: () => void;
     try {
-      unregisterProcessTree = activeProcessTrees.register(killProcessTree);
+      unregisterProcessTree = registerActiveProcessTree(killProcessTree);
     } catch {
       killProcessTree();
       throw TitleProviderError.commandFailed();
