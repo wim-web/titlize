@@ -29,6 +29,32 @@ describe("validateTitle", () => {
     );
   });
 
+  test("外側のbacktickだけを剥がし、内部backtickと不一致backtickを保持する", () => {
+    expect(validateTitle("`outer `inner` text`", 40)).toBe("outer `inner` text");
+    expect(validateTitle("unmatched`", 40)).toBe("unmatched`");
+    expect(validateTitle("通常 `inline` code", 40)).toBe("通常 inline code");
+  });
+
+  test("単語内のunderscoreを保持し、強調マーカーだけを除去する", () => {
+    expect(validateTitle("foo_bar_baz a__b__c", 40)).toBe("foo_bar_baz a__b__c");
+    expect(validateTitle("**bold** __bold__ ~~strike~~ *em* _em_", 40)).toBe("bold bold strike em em");
+  });
+
+  test("記号と括弧を含む生URLを一字も変更しない", () => {
+    expect(validateTitle("https://example.test/a/**segment**?x=~ok~_(v)", 60)).toBe(
+      "https://example.test/a/**segment**?x=~ok~_(v)",
+    );
+  });
+
+  test("括弧を含むリンク先でも表示テキストだけを保持する", () => {
+    expect(validateTitle("[label](https://example.test/a_(b))", 40)).toBe("label");
+    expect(validateTitle("![alt](https://example.test/a_(b))", 40)).toBe("alt");
+  });
+
+  test("空白付き情報文字列と4個以上のbacktick fenceを除去する", () => {
+    expect(validateTitle(" ``` markdown \n認証\n ```` ", 40)).toBe("認証");
+  });
+
   test("外側の引用符と強調を反復して除去し、内側の引用符は保持する", () => {
     expect(validateTitle("# 『**「認証」エラー**』", 40)).toBe("「認証」エラー");
   });
@@ -37,8 +63,27 @@ describe("validateTitle", () => {
     expect(validateTitle("『認証エラー", 40)).toBe("『認証エラー");
   });
 
+  test.each([
+    ['"', '"'],
+    ["'", "'"],
+    ["`", "`"],
+    ["“", "”"],
+    ["‘", "’"],
+    ["「", "」"],
+    ["『", "』"],
+    ["【", "】"],
+  ])("対応する引用符 %s…%s を取り除く", (opening, closing) => {
+    expect(validateTitle(`${opening}認証${closing}`, 40)).toBe("認証");
+  });
+
+  test("内側の引用符は保持し、外側の引用符で露出したMarkdownを反復処理する", () => {
+    expect(validateTitle('"# 『**タイトル**』"', 40)).toBe("タイトル");
+    expect(validateTitle("『「認証」』", 40)).toBe("認証");
+    expect(validateTitle("「認証』", 40)).toBe("「認証』");
+  });
+
   test("空またはマークアップだけのタイトルを拒否する", () => {
-    for (const raw of ["", " \n\t ", "```\n```", "# ", "> ", "- ", "1. "]) {
+    for (const raw of ["", " \n\t ", "```\n```", "# ", "> ", "- ", "1. ", "**", "__", "~~"]) {
       expect(() => validateTitle(raw, 40)).toThrow(TitleValidationError);
     }
   });
