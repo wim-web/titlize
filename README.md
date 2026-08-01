@@ -29,6 +29,8 @@ bun run typecheck
 
 このリポジトリをCodexで開くと、repo-local設定の`.codex/hooks.json`が読み込まれます。Codex内で`/hooks`を実行し、内容を確認してこのHookを信頼してください。一度だけ試す場合はCodex起動時の`--dangerously-bypass-hook-trust`も利用できます。HookのcommandはPOSIX shellの`$()`を使って実行時のGit top-levelを求め、そこにある`src/cli.ts`をBunで実行します。そのため、同梱設定の対応環境はmacOS/Linuxで、このリポジトリ内で使うものです。Windowsで使う場合や別の場所へバイナリを配置する場合は、対象環境に合うcommandとパスを別途設定してください。
 
+2026年8月時点のCodexには、`.git`がdirectoryではなくfileになるGit worktreeで、project-level `.codex/hooks.json`が発見されない[未解決の既知問題](https://github.com/openai/codex/issues/27133)があります。該当するCodexバージョンでは通常のcheckout/cloneから実行するか、上流修正まで同じHookをuser-level `~/.codex/hooks.json`へ登録してください。`--dangerously-bypass-hook-trust`だけではこの発見問題を回避できません。
+
 ## CLI
 
 開発中はTypeScriptを直接実行します。
@@ -146,6 +148,8 @@ printf '%s\n' 'broken-input' | bun src/cli.ts hook
 ```
 
 実Codexでの受け入れ確認は、通常の状態DBと混ぜないよう一時パスで行います。
+
+上記のworktree既知問題に該当する環境では、受け入れ確認も通常のcheckout/cloneで実行してください。
 
 ```bash
 export CODEX_TITLE_EVERY=1
