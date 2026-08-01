@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   normalizeThreadMessages,
@@ -19,20 +20,47 @@ describe("TranscriptReader", () => {
   });
 
   test("対応外のレコードだけなら安全なエラーにする", async () => {
-    const path = join(import.meta.dir, "fixtures", "unsupported.jsonl");
-    await Bun.write(path, '{"type":"response_item","payload":{"type":"reasoning"}}\n');
-    try {
+    await withTemporaryDirectory(async (directory) => {
+      const path = join(directory, "unsupported.jsonl");
+      await Bun.write(path, '{"type":"response_item","payload":{"type":"reasoning"}}\n');
       await expect(new TranscriptReader().read(path)).rejects.toBeInstanceOf(TranscriptError);
-    } finally {
-      await rm(path, { force: true });
-    }
+    });
   });
 
   test("存在しないファイルのパスをエラーmessageに含めない", async () => {
-    const path = "/tmp/secret-transcript-path.jsonl";
-    await expect(new TranscriptReader().read(path)).rejects.toMatchObject({
-      name: "TranscriptError",
-      message: "Unable to read transcript.",
+    await withTemporaryDirectory(async (directory) => {
+      const path = join(directory, "missing.jsonl");
+      await expect(new TranscriptReader().read(path)).rejects.toMatchObject({
+        name: "TranscriptError",
+        message: "Unable to read transcript.",
+      });
+    });
+  });
+
+  test("有効message後の上限超過tool行を安全なエラーにする", async () => {
+    await withTemporaryDirectory(async (directory) => {
+      const path = join(directory, "oversized.jsonl");
+      await Bun.write(
+        path,
+        `${JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "先に有効" }] } })}\n${JSON.stringify({ type: "response_item", payload: { type: "function_call_output", output: "x".repeat(1024 * 1024 + 1) } })}\n`,
+      );
+
+      await expect(new TranscriptReader().read(path)).rejects.toBeInstanceOf(TranscriptError);
+    });
+  });
+
+  test("CRLFとEOF終端なしの最終行を読む", async () => {
+    await withTemporaryDirectory(async (directory) => {
+      const path = join(directory, "crlf.jsonl");
+      await Bun.write(
+        path,
+        `${JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "一行目" }] } })}\r\n${JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "二行目" }] } })}`,
+      );
+
+      await expect(new TranscriptReader().read(path)).resolves.toEqual([
+        { role: "user", content: "一行目" },
+        { role: "assistant", content: "二行目" },
+      ]);
     });
   });
 });
@@ -76,4 +104,27 @@ describe("normalizeThreadMessages", () => {
     expect(() => normalizeThreadMessages({ turns: "invalid" })).toThrow(TranscriptError);
     expect(thread).toEqual(original);
   });
+
+  test("App Serverのmessage数上限を超えると安全なエラーにする", () => {
+    const thread = {
+      turns: [{
+        items: Array.from({ length: 1001 }, () => ({
+          type: "agentMessage",
+          phase: "final_answer",
+          text: "応答",
+        })),
+      }],
+    };
+
+    expect(() => normalizeThreadMessages(thread)).toThrow(TranscriptError);
+  });
 });
+
+async function withTemporaryDirectory(callback: (directory: string) => Promise<void>): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "titlize-transcript-test-"));
+  try {
+    await callback(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}

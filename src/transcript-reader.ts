@@ -1,8 +1,11 @@
 import { createReadStream } from "node:fs";
-import { createInterface } from "node:readline";
 import type { NormalizedMessage } from "./types";
 
 const ERROR_MESSAGE = "Unable to read transcript.";
+const MAX_JSONL_LINE_BYTES = 1024 * 1024;
+const MAX_TRANSCRIPT_BYTES = 128 * 1024 * 1024;
+const MAX_NORMALIZED_MESSAGES = 1000;
+const MAX_NORMALIZED_TEXT_CHARACTERS = 1_000_000;
 
 export class TranscriptError extends Error {
   constructor() {
@@ -14,17 +17,13 @@ export class TranscriptError extends Error {
 export class TranscriptReader {
   async read(path: string): Promise<NormalizedMessage[]> {
     const messages: NormalizedMessage[] = [];
+    let textCharacters = 0;
 
     try {
-      const lines = createInterface({
-        input: createReadStream(path, { encoding: "utf8" }),
-        crlfDelay: Infinity,
-      });
-
-      for await (const line of lines) {
-        const record = parseJson(line);
+      for await (const line of readBoundedJsonlLines(path)) {
+        const record = parseJson(line.toString("utf8"));
         const message = normalizeRolloutRecord(record);
-        if (message) messages.push(message);
+        if (message) textCharacters = appendMessage(messages, message, textCharacters);
       }
     } catch {
       throw new TranscriptError();
@@ -41,13 +40,14 @@ export function normalizeThreadMessages(thread: unknown): NormalizedMessage[] {
   if (!turns) throw new TranscriptError();
 
   const messages: NormalizedMessage[] = [];
+  let textCharacters = 0;
   for (const turn of turns) {
     const turnObject = asObject(turn);
     if (!turnObject || !Array.isArray(turnObject.items)) continue;
 
     for (const item of turnObject.items) {
       const message = normalizeThreadItem(item);
-      if (message) messages.push(message);
+      if (message) textCharacters = appendMessage(messages, message, textCharacters);
     }
   }
 
@@ -88,7 +88,7 @@ function normalizeThreadItem(item: unknown): NormalizedMessage | null {
     return textMessage("user", value.content, new Set(["text"]));
   }
   if (value.type === "agentMessage" && isFinalPhase(value.phase) && typeof value.text === "string") {
-    const content = value.text.trim();
+    const content = normalizeText(value.text);
     return content ? { role: "assistant", content } : null;
   }
   return null;
@@ -101,6 +101,7 @@ function textMessage(
 ): NormalizedMessage | null {
   if (!Array.isArray(content)) return null;
   const parts: string[] = [];
+  let textCharacters = 0;
   for (const part of content) {
     const value = asObject(part);
     if (
@@ -110,11 +111,73 @@ function textMessage(
       typeof value.text === "string" &&
       value.text.trim()
     ) {
+      textCharacters += value.text.length + (parts.length > 0 ? 1 : 0);
+      if (textCharacters > MAX_NORMALIZED_TEXT_CHARACTERS) throw new TranscriptError();
       parts.push(value.text);
     }
   }
-  const joined = parts.join("\n").trim();
+  const joined = normalizeText(parts.join("\n"));
   return joined ? { role, content: joined } : null;
+}
+
+function normalizeText(text: string): string {
+  const normalized = text.trim();
+  if (normalized.length > MAX_NORMALIZED_TEXT_CHARACTERS) throw new TranscriptError();
+  return normalized;
+}
+
+function appendMessage(
+  messages: NormalizedMessage[],
+  message: NormalizedMessage,
+  textCharacters: number,
+): number {
+  if (messages.length >= MAX_NORMALIZED_MESSAGES) throw new TranscriptError();
+  const nextTextCharacters = textCharacters + message.content.length;
+  if (nextTextCharacters > MAX_NORMALIZED_TEXT_CHARACTERS) throw new TranscriptError();
+  messages.push(message);
+  return nextTextCharacters;
+}
+
+async function* readBoundedJsonlLines(path: string): AsyncGenerator<Buffer> {
+  const stream = createReadStream(path);
+  const parts: Buffer[] = [];
+  let lineBytes = 0;
+  let totalBytes = 0;
+
+  const append = (part: Buffer): void => {
+    lineBytes += part.length;
+    // One trailing CR may still be removed when a following LF completes the line.
+    if (lineBytes > MAX_JSONL_LINE_BYTES + 1) throw new TranscriptError();
+    parts.push(part);
+  };
+
+  const takeLine = (): Buffer => {
+    const line = Buffer.concat(parts, lineBytes);
+    parts.length = 0;
+    lineBytes = 0;
+    const withoutCarriageReturn = line.at(-1) === 0x0d ? line.subarray(0, -1) : line;
+    if (withoutCarriageReturn.length > MAX_JSONL_LINE_BYTES) throw new TranscriptError();
+    return withoutCarriageReturn;
+  };
+
+  try {
+    for await (const chunk of stream) {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_TRANSCRIPT_BYTES) throw new TranscriptError();
+
+      let start = 0;
+      for (let index = 0; index < chunk.length; index += 1) {
+        if (chunk[index] !== 0x0a) continue;
+        append(chunk.subarray(start, index));
+        yield takeLine();
+        start = index + 1;
+      }
+      if (start < chunk.length) append(chunk.subarray(start));
+    }
+    if (lineBytes > 0) yield takeLine();
+  } finally {
+    stream.destroy();
+  }
 }
 
 function isFinalPhase(phase: unknown): boolean {
