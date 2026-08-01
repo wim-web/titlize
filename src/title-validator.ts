@@ -67,7 +67,7 @@ export function validateTitle(raw: string, maxChars: number): string {
   let stabilized = false;
   for (let pass = 0; pass <= raw.length; pass += 1) {
     const previous = title;
-    title = unwrapQuotes(title, placeholders);
+    title = unwrapQuotes(title);
     title = stripLeadingMarkers(title);
     title = replaceMarkdownLinks(title);
     title = protectUrls(title, placeholders);
@@ -165,20 +165,20 @@ function findClosingParenthesis(value: string, start: number): number {
 }
 
 function protectUrls(value: string, placeholders: PlaceholderStore): string {
-  return value.replace(/https?:\/\/[^\s"“”‘’「」『』【】`]+/g, (url, offset: number, input: string) => {
-    const quotedOpening = readOpeningMarkers(input, offset - 1);
-    if (input[offset - 1] === "'" && quotedOpening && url.endsWith(`'${quotedOpening}`)) {
-      return `${placeholders.create("url", url.slice(0, -quotedOpening.length - 1))}'${quotedOpening}`;
+  return value.replace(/'?https?:\/\/[^\s"“”‘’「」『』【】`]+/g, (url, offset: number, input: string) => {
+    const suffix = url.match(/[.,;:!?。、\)\]\}]+$/)?.[0] ?? "";
+    const core = suffix ? url.slice(0, -suffix.length) : url;
+    const quotedOpening = readOpeningMarkers(input, offset);
+    if (url.startsWith("'") && quotedOpening && core.endsWith(`'${quotedOpening}`)) {
+      return `${placeholders.create(core.slice(1, -quotedOpening.length - 1))}${quotedOpening}${suffix}`;
     }
     const expectedClosing = readOpeningMarkers(input, offset);
     if (expectedClosing) {
-      const suffix = url.match(/[.,;:!?。、\)\]\}]+$/)?.[0] ?? "";
-      const core = suffix ? url.slice(0, -suffix.length) : url;
       if (core.endsWith(expectedClosing)) {
-        return `${placeholders.create("url", core.slice(0, -expectedClosing.length))}${expectedClosing}${suffix}`;
+        return `${placeholders.create(core.slice(0, -expectedClosing.length))}${expectedClosing}${suffix}`;
       }
     }
-    return placeholders.create("url", url);
+    return placeholders.create(url);
   });
 }
 
@@ -272,7 +272,7 @@ function stripInlineCode(value: string): string {
   return result;
 }
 
-function unwrapQuotes(value: string, _placeholders: PlaceholderStore): string {
+function unwrapQuotes(value: string): string {
   let result = value;
   let changed = true;
   while (changed) {
@@ -304,7 +304,7 @@ class PlaceholderStore {
     throw TitleValidationError.tooLong();
   }
 
-  create(_kind: "url" | "backtick", value: string): string {
+  create(value: string): string {
     const token = `${this.namespace}${this.tokens.size.toString(36)}${this.namespace}`;
     this.tokens.set(token, value);
     return token;

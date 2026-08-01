@@ -99,6 +99,8 @@ describe("validateTitle", () => {
 
   test("apostropheで囲んだURLの外側Markdownを除去し、裸URLの内部apostropheは保持する", () => {
     expect(validateTitle("**'https://example.test/a'**", 200)).toBe("https://example.test/a");
+    expect(validateTitle("**'https://x.test'**.", 200)).toBe("https://x.test.");
+    expect(validateTitle("(**'https://x.test'**)", 200)).toBe("(https://x.test)");
     expect(validateTitle("https://example.test/a'**b**", 200)).toBe("https://example.test/a'**b**");
   });
 
@@ -107,6 +109,10 @@ describe("validateTitle", () => {
     const raw = `${pua}https://x.test ${pua}https://x.test`;
     expect(validateTitle(raw, 200)).toBe(raw);
     expect(validateTitle(`${pua.repeat(4000)} https://x.test`, 4096)).toBe(`${pua.repeat(4000)} https://x.test`);
+    const oldCollision = `${pua}[](x)${pua}https://x.test`;
+    expect(validateTitle(oldCollision, 200)).toBe(`${pua}${pua}https://x.test`);
+    const manyUrls = Array.from({ length: 40 }, (_, index) => `https://x.test/${index}`).join(" ");
+    expect(validateTitle(manyUrls, 1000)).toBe(manyUrls);
   });
 
   test("URLを囲むMarkdownだけを除去し、囲まれていないURL末尾記号は保持する", () => {
