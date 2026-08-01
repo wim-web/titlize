@@ -1,6 +1,6 @@
 # titlize
 
-Codexの同期`Stop` Hookから、セッションごとの一定回数ごとに会話を要約し、Codex App Server経由でタスク名を更新するBun + TypeScript CLIです。タイトル生成には一時的な子Codexを使います。初版は単発CLIとして実装し、常駐デーモンやPlugin/Skill化は含みません。
+Codexの同期`Stop` Hookから、セッションごとの一定回数ごとに会話を要約し、Codex App Server経由でタスク名を更新するBun + TypeScript CLIです。タイトル生成には一時的な子Codexを使います。ユーザー共通Hookとしてインストールするため、Codexで開くすべてのプロジェクトに適用されます。初版は単発CLIとして実装し、常駐デーモンやPlugin/Skill化は含みません。
 
 ## 動作の流れ
 
@@ -15,7 +15,7 @@ Stop Hook
   → SQLite StateStore（成功または再試行状態を保存）
 ```
 
-Hookは同期実行です。更新対象の`Stop`では、タイトル生成とApp Server更新が終わるまでHookが完了しません。通常更新の内部処理は最大でApp Server RPC 3回と子Codex 1回を順に行い、各操作の設定上限は30秒です。リポジトリ内の[`.codex/hooks.json`](.codex/hooks.json)は、その合計120秒にcleanup用30秒を加えた150秒をcommand Hookの上限にしています。Transcriptファイル自体のI/OやOS schedulingまでこの計算で保証するものではありません。
+Hookは同期実行です。更新対象の`Stop`では、タイトル生成とApp Server更新が終わるまでHookが完了しません。通常更新の内部処理は最大でApp Server RPC 3回と子Codex 1回を順に行い、各操作の設定上限は30秒です。インストーラーが`~/.codex/hooks.json`へ登録するHookは、その合計120秒にcleanup用30秒を加えた150秒をcommand Hookの上限にしています。Transcriptファイル自体のI/OやOS schedulingまでこの計算で保証するものではありません。
 
 ## セットアップ
 
@@ -25,11 +25,27 @@ Bun 1.3系と、通常利用できる状態のCodex CLIが必要です。
 bun install
 bun test
 bun run typecheck
+bun run install:user
 ```
 
-このリポジトリをCodexで開くと、repo-local設定の`.codex/hooks.json`が読み込まれます。Codex内で`/hooks`を実行し、内容を確認してこのHookを信頼してください。一度だけ試す場合はCodex起動時の`--dangerously-bypass-hook-trust`も利用できます。HookのcommandはPOSIX shellの`$()`を使って実行時のGit top-levelを求め、そこにある`src/cli.ts`をBunで実行します。そのため、同梱設定の対応環境はmacOS/Linuxで、このリポジトリ内で使うものです。Windowsで使う場合や別の場所へバイナリを配置する場合は、対象環境に合うcommandとパスを別途設定してください。
+`install:user`は通常bundleを作り、次の場所へインストールします。
 
-2026年8月時点のCodexには、`.git`がdirectoryではなくfileになるGit worktreeで、project-level `.codex/hooks.json`が発見されない[未解決の既知問題](https://github.com/openai/codex/issues/27133)があります。該当するCodexバージョンでは通常のcheckout/cloneから実行するか、上流修正まで同じHookをuser-level `~/.codex/hooks.json`へ登録してください。`--dangerously-bypass-hook-trust`だけではこの発見問題を回避できません。
+```text
+${CODEX_HOME:-~/.codex}/titlize/codex-title
+${CODEX_HOME:-~/.codex}/hooks.json
+```
+
+既存のユーザーHookは保持し、titlizeの`Stop` Hookだけを追加または更新します。Hookはインストール時に検出したBunの絶対パスと、インストール済みbundleの絶対パスを使うため、起動中のプロジェクトやGit rootには依存しません。
+
+インストール後にCodexで`/hooks`を実行し、内容を確認して`titlize: タスク名を更新しています`というHookを信頼してください。一度だけ試す場合はCodex起動時の`--dangerously-bypass-hook-trust`も利用できます。ユーザー共通Hookなので、その後はどのプロジェクトをCodexで開いても動作します。
+
+コード更新後は`bun run install:user`を再実行するとbundleとHookを更新します。削除するときは次を実行します。既存の他のユーザーHookは削除しません。
+
+```bash
+bun run uninstall:user
+```
+
+同梱インストーラーの対応環境はmacOS/Linuxです。WindowsではHook commandとインストールパスを対象環境に合わせる必要があります。
 
 ## CLI
 
@@ -50,7 +66,7 @@ bun run build
 bun dist/codex-title update --session-id <session-id> --force
 ```
 
-Bunランタイム込みの単一実行ファイルが必要な場合は、将来の配布形態と同じく`--compile`を使います。この手順はrepo-local Hookには必須ではありません。macOSではcompile時または配布時のcode signingが実行環境固有の工程になることがあり、このリポジトリは署名identityや配布用署名を設定しません。Bun 1.3.12のcompileがローカルの署名環境で失敗する場合は、上のbundleをBunから実行するか、配布環境側で署名工程を構成してください。
+Bunランタイム込みの単一実行ファイルが必要な場合は、将来の配布形態と同じく`--compile`を使います。`install:user`はBunで実行する通常bundleを使うため、この手順は必須ではありません。macOSではcompile時または配布時のcode signingが実行環境固有の工程になることがあり、このリポジトリは署名identityや配布用署名を設定しません。Bun 1.3.12のcompileがローカルの署名環境で失敗する場合は、通常bundleを使うか、配布環境側で署名工程を構成してください。
 
 ```bash
 bun build --compile --outfile=dist/codex-title-bin src/cli.ts
@@ -69,7 +85,7 @@ bun build --compile --outfile=dist/codex-title-bin src/cli.ts
 | `CODEX_TITLE_STATE_PATH` | `${CODEX_HOME:-~/.codex}/codex-title/state.sqlite3` | SQLite状態ファイル |
 | `CODEX_TITLE_APP_SERVER` | `stdio://` | App Server transport。初版は`stdio://`のみ |
 
-整数設定は正の10進整数だけを受け入れ、`CODEX_TITLE_TIMEOUT_MS`は最大30000に制限します。通常Hookの最悪構成はこの上限の4倍なので、`.codex/hooks.json`は150秒に固定しています。コード側の上限を変更する場合は、4倍の内部処理枠とcleanup余裕を保つようHook timeoutも同時に変更してください。Providerやtransportを含む不正な設定は、状態DBを開く前にHook更新をスキップします。
+整数設定は正の10進整数だけを受け入れ、`CODEX_TITLE_TIMEOUT_MS`は最大30000に制限します。通常Hookの最悪構成はこの上限の4倍なので、インストーラーが生成するHookは150秒に固定しています。コード側の上限を変更する場合は、4倍の内部処理枠とcleanup余裕を保つようHook timeoutも同時に変更してください。Providerやtransportを含む不正な設定は、状態DBを開く前にHook更新をスキップします。
 
 ## 更新周期、再試行、手動タイトル保護
 
@@ -147,9 +163,7 @@ printf '%s\n' '{"hook_event_name":"SessionStart"}' | bun src/cli.ts hook
 printf '%s\n' 'broken-input' | bun src/cli.ts hook
 ```
 
-実Codexでの受け入れ確認は、通常の状態DBと混ぜないよう一時パスで行います。
-
-上記のworktree既知問題に該当する環境では、受け入れ確認も通常のcheckout/cloneで実行してください。
+実Codexでの受け入れ確認は、先に`bun run install:user`を実行し、通常の状態DBと混ぜないよう一時パスで行います。ユーザー共通Hookなので、任意のプロジェクトから実行できます。
 
 ```bash
 export CODEX_TITLE_EVERY=1
