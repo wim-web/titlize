@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StateStore, shouldUpdate } from "../src/state-store";
@@ -58,6 +58,17 @@ describe("StateStore", () => {
     });
   });
 
+  test("非連続に再送された古い turn も二重加算しない", () => {
+    const { store } = openStore();
+    store.recordStop("s1", "t1", "first");
+    store.recordStop("s1", "t2", "second");
+
+    expect(store.recordStop("s1", "t1", "replayed")).toEqual({
+      isNewTurn: false,
+      state: expect.objectContaining({ stopCount: 2, lastTurnId: "t2", updatedAt: "second" }),
+    });
+  });
+
   test("同じ DB の2接続から同一 turn を記録しても一度だけ加算する", () => {
     const path = join(mkdtempSync(join(tmpdir(), "titlize-state-")), "state.sqlite3");
     const first = openStore(path).store;
@@ -68,6 +79,52 @@ describe("StateStore", () => {
       isNewTurn: false,
       state: expect.objectContaining({ stopCount: 1, updatedAt: "first" }),
     });
+  });
+
+  test("4つの Bun プロセスが同じ turn を同時記録しても一度だけ加算する", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "titlize-state-workers-"));
+    const databasePath = join(directory, "state.sqlite3");
+    const gatePath = join(directory, "start");
+    const helperPath = join(import.meta.dir, "helpers", "record-stop-worker.ts");
+    const setup = openStore(databasePath).store;
+    closeStore(setup);
+    const workers = Array.from({ length: 4 }, (_, index) => {
+      const readyPath = join(directory, `ready-${index}`);
+      return Bun.spawn({
+        cmd: [process.execPath, helperPath, databasePath, "s1", "t1", gatePath, readyPath],
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+    });
+
+    let released = false;
+    try {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (workers.every((_, index) => existsSync(join(directory, `ready-${index}`)))) break;
+        await Bun.sleep(10);
+      }
+      expect(workers.every((_, index) => existsSync(join(directory, `ready-${index}`)))).toBe(true);
+
+      writeFileSync(gatePath, "go");
+      released = true;
+      const results = await Promise.all(workers.map(async (worker) => ({
+        exitCode: await worker.exited,
+        stdout: await new Response(worker.stdout).text(),
+        stderr: await new Response(worker.stderr).text(),
+      })));
+
+      if (results.some((result) => result.exitCode !== 0)) {
+        throw new Error(`Worker failed: ${JSON.stringify(results)}`);
+      }
+      expect(results.map((result) => result.stderr)).toEqual(["", "", "", ""]);
+      expect(results.map((result) => JSON.parse(result.stdout).isNewTurn).filter(Boolean)).toHaveLength(1);
+
+      const { store } = openStore(databasePath);
+      expect(store.getSession("s1")).toEqual(expect.objectContaining({ stopCount: 1, lastTurnId: "t1" }));
+    } finally {
+      if (!released) writeFileSync(gatePath, "go");
+      await Promise.all(workers.map((worker) => worker.exited));
+    }
   });
 
   test("セッションの状態を完全に分離する", () => {
