@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   BunCommandRunner,
   CodexTitleProvider,
@@ -168,6 +171,56 @@ describe("BunCommandRunner", () => {
     ).resolves.toEqual({ exitCode: 0, stdout: "after-timeout", timedOut: false });
   });
 
+  test("timeout時にstdioを継承した孫processごとboundedに回収する", async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-provider-tree-"));
+    const pidFile = join(temporaryDirectory, "grandchild.pid");
+    let grandchildPid: number | undefined;
+
+    try {
+      const startedAt = performance.now();
+      const result = await bunRunner().run(
+        request(
+          [
+            "const child = Bun.spawn([process.execPath, '-e', 'await Bun.sleep(2_000)'], {",
+            "  stdin: 'ignore', stdout: 'inherit', stderr: 'inherit',",
+            "});",
+            "await Bun.write(process.env.GRANDCHILD_PID_FILE, String(child.pid));",
+            "await Bun.sleep(10_000);",
+          ].join("\n"),
+          {
+            timeoutMs: 40,
+            env: { PATH: process.env.PATH, GRANDCHILD_PID_FILE: pidFile },
+          },
+        ),
+      );
+      const elapsedMs = performance.now() - startedAt;
+      grandchildPid = Number(await readFile(pidFile, "utf8"));
+
+      expect(result.timedOut).toBe(true);
+      expect(elapsedMs).toBeLessThan(1_000);
+      expect(await waitForProcessExit(grandchildPid, 500)).toBe(true);
+      await expect(
+        bunRunner().run(request('process.stdout.write("after-tree-timeout");')),
+      ).resolves.toEqual({ exitCode: 0, stdout: "after-tree-timeout", timedOut: false });
+    } finally {
+      if (grandchildPid === undefined) {
+        try {
+          grandchildPid = Number(await readFile(pidFile, "utf8"));
+        } catch {
+          // The child may have been killed before it persisted its PID.
+        }
+      }
+      if (Number.isSafeInteger(grandchildPid) && grandchildPid! > 0) {
+        try {
+          process.kill(grandchildPid!, "SIGKILL");
+        } catch {
+          // Already reaped.
+        }
+      }
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+
   test("32-bit上限を超えるtimeoutを1msへ丸めない", async () => {
     const result = await bunRunner().run(
       request('await Bun.sleep(30); process.stdout.write("not-timed-out");', {
@@ -206,3 +259,16 @@ describe("BunCommandRunner", () => {
     }
   });
 });
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await Bun.sleep(10);
+  }
+  return false;
+}

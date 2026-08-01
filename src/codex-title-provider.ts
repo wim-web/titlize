@@ -3,6 +3,8 @@ import type { TitleProvider, TitleProviderInput } from "./types";
 const MAX_STDOUT_CODE_UNITS = 4096;
 const MAX_STDOUT_BYTES = 16 * 1024;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const CLEANUP_GRACE_MS = 200;
+const FINAL_REAP_GRACE_MS = 100;
 
 type TitleProviderErrorReason = "commandFailed" | "timedOut" | "empty" | "outputTooLarge";
 
@@ -123,6 +125,7 @@ export class BunCommandRunner implements CommandRunner {
     let subprocess: Bun.PipedSubprocess;
     try {
       subprocess = Bun.spawn([this.command, ...request.args], {
+        detached: true,
         env: request.env,
         stdin: "pipe",
         stdout: "pipe",
@@ -133,7 +136,15 @@ export class BunCommandRunner implements CommandRunner {
     }
 
     let timedOut = false;
-    const kill = (): void => {
+    let outputTooLarge = false;
+    const killProcessTree = (): void => {
+      if (process.platform !== "win32") {
+        try {
+          process.kill(-subprocess.pid, "SIGKILL");
+        } catch {
+          // The child may already have exited or process groups may be unavailable.
+        }
+      }
       try {
         subprocess.kill("SIGKILL");
       } catch {
@@ -141,22 +152,59 @@ export class BunCommandRunner implements CommandRunner {
       }
     };
 
+    let stdoutTask: CancelableRead<string> | undefined;
+    let stderrTask: CancelableRead<void> | undefined;
+    let cleanupStarted = false;
+    let resolveCleanupStarted = (): void => {};
+    const cleanupStartedPromise = new Promise<void>((resolve) => {
+      resolveCleanupStarted = resolve;
+    });
+    let cleanupDeadlinePromise: Promise<void> | undefined;
+    let cancelCleanupDeadline = (): void => {};
+
+    const forceCloseIo = (): void => {
+      try {
+        const closeResult = subprocess.stdin.end();
+        void Promise.resolve(closeResult).catch(() => {});
+      } catch {
+        // The pipe may already be closed.
+      }
+      stdoutTask?.cancel();
+      stderrTask?.cancel();
+    };
+
+    const beginCleanup = (): void => {
+      killProcessTree();
+      if (cleanupStarted) return;
+      cleanupStarted = true;
+      cleanupDeadlinePromise = new Promise<void>((resolve) => {
+        cancelCleanupDeadline = scheduleLongTimeout(CLEANUP_GRACE_MS, () => {
+          forceCloseIo();
+          killProcessTree();
+          resolve();
+        });
+      });
+      resolveCleanupStarted();
+    };
+
     const stdinPromise = writeStdin(subprocess.stdin, request.stdin);
-    const stdoutPromise = readLimitedStdout(subprocess.stdout, kill);
-    const stderrPromise = drainStream(subprocess.stderr);
+    stdoutTask = readLimitedStdout(subprocess.stdout, () => {
+      outputTooLarge = true;
+      beginCleanup();
+    });
+    stderrTask = drainStream(subprocess.stderr);
+    const stdoutPromise = stdoutTask.promise;
+    const stderrPromise = stderrTask.promise;
     const exitPromise = subprocess.exited;
 
-    void stdinPromise.catch(kill);
-    void stdoutPromise.catch(kill);
-    void stderrPromise.catch(kill);
+    void stdinPromise.catch(beginCleanup);
+    void stdoutPromise.catch(beginCleanup);
+    void stderrPromise.catch(beginCleanup);
+    void exitPromise.catch(beginCleanup);
 
-    let cancelTimeout = (): void => {};
-    const timeoutPromise = new Promise<void>((resolve) => {
-      cancelTimeout = scheduleLongTimeout(request.timeoutMs, () => {
-        timedOut = true;
-        kill();
-        resolve();
-      });
+    const cancelTimeout = scheduleLongTimeout(request.timeoutMs, () => {
+      timedOut = true;
+      beginCleanup();
     });
 
     const settledPromise = Promise.allSettled([
@@ -165,11 +213,40 @@ export class BunCommandRunner implements CommandRunner {
       stderrPromise,
       exitPromise,
     ]);
+    let fullySettled = false;
+    const settledSignal = settledPromise.then(() => {
+      fullySettled = true;
+    });
+
+    let cancelFinalReapDeadline = (): void => {};
     try {
-      await Promise.race([settledPromise.then(() => undefined), timeoutPromise]);
+      await Promise.race([settledSignal, cleanupStartedPromise]);
+      if (cleanupStarted && !fullySettled) {
+        await Promise.race([settledSignal, cleanupDeadlinePromise!]);
+      }
+      if (!fullySettled) {
+        forceCloseIo();
+        killProcessTree();
+        const finalReapDeadline = new Promise<void>((resolve) => {
+          cancelFinalReapDeadline = scheduleLongTimeout(FINAL_REAP_GRACE_MS, resolve);
+        });
+        await Promise.race([settledSignal, finalReapDeadline]);
+      }
     } finally {
       cancelTimeout();
+      cancelCleanupDeadline();
+      cancelFinalReapDeadline();
     }
+
+    if (outputTooLarge) throw TitleProviderError.outputTooLarge();
+    if (timedOut) {
+      return {
+        exitCode: subprocess.exitCode ?? -1,
+        stdout: "",
+        timedOut: true,
+      };
+    }
+    if (!fullySettled) throw TitleProviderError.commandFailed();
 
     const [stdinResult, stdoutResult, stderrResult, exitResult] = await settledPromise;
 
@@ -191,6 +268,11 @@ export class BunCommandRunner implements CommandRunner {
       timedOut,
     };
   }
+}
+
+interface CancelableRead<T> {
+  promise: Promise<T>;
+  cancel(): void;
 }
 
 function scheduleLongTimeout(timeoutMs: number, onTimeout: () => void): () => void {
@@ -245,54 +327,70 @@ async function writeStdin(stdin: Bun.FileSink, value: string): Promise<void> {
   }
 }
 
-async function drainStream(stream: ReadableStream<Uint8Array>): Promise<void> {
+function drainStream(stream: ReadableStream<Uint8Array>): CancelableRead<void> {
   const reader = stream.getReader();
-  try {
-    while (!(await reader.read()).done) {
-      // Discard stderr while continuing to apply backpressure.
+  const promise = (async () => {
+    try {
+      while (!(await reader.read()).done) {
+        // Discard stderr while continuing to apply backpressure.
+      }
+    } finally {
+      reader.releaseLock();
     }
-  } finally {
-    reader.releaseLock();
-  }
+  })();
+  return {
+    promise,
+    cancel: () => {
+      void reader.cancel().catch(() => {});
+    },
+  };
 }
 
-async function readLimitedStdout(
+function readLimitedStdout(
   stream: ReadableStream<Uint8Array>,
   onLimitExceeded: () => void,
-): Promise<string> {
+): CancelableRead<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let byteLength = 0;
   let result = "";
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+  const promise = (async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      byteLength += value.byteLength;
-      if (byteLength > MAX_STDOUT_BYTES) {
-        onLimitExceeded();
-        throw TitleProviderError.outputTooLarge();
+        byteLength += value.byteLength;
+        if (byteLength > MAX_STDOUT_BYTES) {
+          onLimitExceeded();
+          throw TitleProviderError.outputTooLarge();
+        }
+
+        result += decoder.decode(value, { stream: true });
+        if (result.length > MAX_STDOUT_CODE_UNITS) {
+          onLimitExceeded();
+          throw TitleProviderError.outputTooLarge();
+        }
       }
 
-      result += decoder.decode(value, { stream: true });
+      result += decoder.decode();
       if (result.length > MAX_STDOUT_CODE_UNITS) {
         onLimitExceeded();
         throw TitleProviderError.outputTooLarge();
       }
+      return result;
+    } catch (error) {
+      if (error instanceof TitleProviderError) throw error;
+      throw TitleProviderError.commandFailed();
+    } finally {
+      reader.releaseLock();
     }
-
-    result += decoder.decode();
-    if (result.length > MAX_STDOUT_CODE_UNITS) {
-      onLimitExceeded();
-      throw TitleProviderError.outputTooLarge();
-    }
-    return result;
-  } catch (error) {
-    if (error instanceof TitleProviderError) throw error;
-    throw TitleProviderError.commandFailed();
-  } finally {
-    reader.releaseLock();
-  }
+  })();
+  return {
+    promise,
+    cancel: () => {
+      void reader.cancel().catch(() => {});
+    },
+  };
 }
