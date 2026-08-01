@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import type { NormalizedMessage, TitleProvider, TitleProviderInput } from "./types";
 
 const MAX_STDOUT_CODE_UNITS = 4096;
@@ -6,6 +9,7 @@ const MAX_STDIN_CODE_UNITS = 8 * 1024 * 1024;
 const MAX_MESSAGES = 1_000;
 const MAX_TOTAL_CONTENT_CODE_UNITS = 1_000_000;
 const MAX_PREVIOUS_TITLE_CODE_UNITS = 4_096;
+const MAX_CWD_CODE_UNITS = 4_096;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const CLEANUP_GRACE_MS = 200;
 const FINAL_REAP_GRACE_MS = 100;
@@ -35,14 +39,14 @@ const CODEX_ISOLATION_ARGS = [
   "shell_tool",
   "--disable",
   "remote_plugin",
+  "--disable",
+  "apps",
+  "--disable",
+  "plugins",
   "-c",
   'web_search="disabled"',
   "-c",
   "agents.enabled=false",
-  "-c",
-  "mcp_servers={}",
-  "-c",
-  "plugins={}",
   "-c",
   "tools.view_image=false",
   "-c",
@@ -86,6 +90,7 @@ export interface CommandRunRequest {
   env: Record<string, string | undefined>;
   stdin: string;
   timeoutMs: number;
+  cwd: string;
 }
 
 export interface CommandResult {
@@ -233,11 +238,19 @@ class ActiveProcessTreeRegistry {
 // cleanup of any detached process group that the operating system leaves behind.
 const activeProcessTrees = new ActiveProcessTreeRegistry();
 
+export interface TemporaryWorkspace {
+  readonly cwd: string;
+  cleanup(): Promise<void>;
+}
+
+export type TemporaryWorkspaceFactory = () => Promise<TemporaryWorkspace>;
+
 interface CodexTitleProviderOptions {
   model: string;
   timeoutMs: number;
   runner?: CommandRunner;
   baseEnv?: Record<string, string | undefined>;
+  temporaryWorkspaceFactory?: TemporaryWorkspaceFactory;
 }
 
 export class CodexTitleProvider implements TitleProvider {
@@ -245,12 +258,14 @@ export class CodexTitleProvider implements TitleProvider {
   private readonly timeoutMs: number;
   private readonly runner: CommandRunner;
   private readonly baseEnv: Record<string, string | undefined>;
+  private readonly temporaryWorkspaceFactory: TemporaryWorkspaceFactory;
 
   constructor(options: CodexTitleProviderOptions) {
     this.model = options.model;
     this.timeoutMs = options.timeoutMs;
     this.runner = options.runner ?? new BunCommandRunner();
     this.baseEnv = selectChildEnvironment(options.baseEnv ?? process.env);
+    this.temporaryWorkspaceFactory = options.temporaryWorkspaceFactory ?? createTemporaryWorkspace;
   }
 
   async generateTitle(input: TitleProviderInput): Promise<string> {
@@ -261,35 +276,52 @@ export class CodexTitleProvider implements TitleProvider {
       throw TitleProviderError.commandFailed();
     }
 
-    let result: CommandResult;
+    let workspace: TemporaryWorkspace;
     try {
-      result = await this.runner.run({
-        args: [
-          "exec",
-          "--model",
-          this.model,
-          "--ephemeral",
-          "--disable",
-          "hooks",
-          "--ignore-rules",
-          "--sandbox",
-          "read-only",
-          ...CODEX_ISOLATION_ARGS,
-          "-",
-        ],
-        env: { ...this.baseEnv, CODEX_TITLE_CHILD: "1" },
-        stdin: prompt,
-        timeoutMs: this.timeoutMs,
-      });
-    } catch (error) {
-      if (error instanceof TitleProviderError) throw error;
+      workspace = await this.temporaryWorkspaceFactory();
+    } catch {
       throw TitleProviderError.commandFailed();
     }
 
-    if (result.timedOut) throw TitleProviderError.timedOut();
-    if (result.exitCode !== 0) throw TitleProviderError.commandFailed();
-    if (result.stdout.trim().length === 0) throw TitleProviderError.empty();
-    return result.stdout;
+    try {
+      let result: CommandResult;
+      try {
+        result = await this.runner.run({
+          args: [
+            "exec",
+            "--model",
+            this.model,
+            "--ephemeral",
+            "--ignore-user-config",
+            "--disable",
+            "hooks",
+            "--ignore-rules",
+            "--sandbox",
+            "read-only",
+            ...CODEX_ISOLATION_ARGS,
+            "-",
+          ],
+          env: { ...this.baseEnv, CODEX_TITLE_CHILD: "1" },
+          stdin: prompt,
+          timeoutMs: this.timeoutMs,
+          cwd: workspace.cwd,
+        });
+      } catch (error) {
+        if (error instanceof TitleProviderError) throw error;
+        throw TitleProviderError.commandFailed();
+      }
+
+      if (result.timedOut) throw TitleProviderError.timedOut();
+      if (result.exitCode !== 0) throw TitleProviderError.commandFailed();
+      if (result.stdout.trim().length === 0) throw TitleProviderError.empty();
+      return result.stdout;
+    } finally {
+      try {
+        await workspace.cleanup();
+      } catch {
+        // Workspace cleanup must not replace a generated candidate or the original runner error.
+      }
+    }
   }
 }
 
@@ -308,6 +340,7 @@ export class BunCommandRunner implements CommandRunner {
     try {
       subprocess = Bun.spawn([this.command, ...validatedRequest.args], {
         detached: true,
+        cwd: validatedRequest.cwd,
         env: validatedRequest.env,
         stdin: "pipe",
         stdout: "pipe",
@@ -565,7 +598,7 @@ function validateProviderInput(input: unknown): TitleProviderInput {
 }
 
 function validateCommandRunRequest(request: unknown): CommandRunRequest {
-  if (!isPlainRecord(request) || !hasOnlyKeys(request, ["args", "env", "stdin", "timeoutMs"])) {
+  if (!isPlainRecord(request) || !hasOnlyKeys(request, ["args", "env", "stdin", "timeoutMs", "cwd"])) {
     throw TitleProviderError.commandFailed();
   }
 
@@ -573,6 +606,7 @@ function validateCommandRunRequest(request: unknown): CommandRunRequest {
   const env = request.env;
   const stdin = request.stdin;
   const timeoutMs = request.timeoutMs;
+  const cwd = request.cwd;
   if (
     !Array.isArray(args) ||
     !hasOnlyDenseArrayIndices(args) ||
@@ -582,7 +616,12 @@ function validateCommandRunRequest(request: unknown): CommandRunRequest {
     stdin.length > MAX_STDIN_CODE_UNITS ||
     typeof timeoutMs !== "number" ||
     !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs <= 0
+    timeoutMs <= 0 ||
+    typeof cwd !== "string" ||
+    cwd.length === 0 ||
+    cwd.length > MAX_CWD_CODE_UNITS ||
+    cwd.includes("\0") ||
+    !isAbsolute(cwd)
   ) {
     throw TitleProviderError.commandFailed();
   }
@@ -594,7 +633,17 @@ function validateCommandRunRequest(request: unknown): CommandRunRequest {
     }
     copiedEnv[key] = value;
   }
-  return { args: [...args] as string[], env: copiedEnv, stdin, timeoutMs };
+  return { args: [...args] as string[], env: copiedEnv, stdin, timeoutMs, cwd };
+}
+
+async function createTemporaryWorkspace(): Promise<TemporaryWorkspace> {
+  const cwd = await mkdtemp(join(tmpdir(), "titlize-title-"));
+  return {
+    cwd,
+    cleanup: async () => {
+      await rm(cwd, { recursive: true, force: true });
+    },
+  };
 }
 
 function buildPrompt(input: TitleProviderInput): string {

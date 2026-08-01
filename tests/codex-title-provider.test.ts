@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   BunCommandRunner,
   CodexTitleProvider,
@@ -22,10 +22,12 @@ class FakeRunner implements CommandRunner {
       stdout: "認証エラーの原因調査",
       timedOut: false,
     },
+    private readonly onRun?: (request: CommandRunRequest) => void | Promise<void>,
   ) {}
 
   async run(request: CommandRunRequest): Promise<CommandResult> {
     this.calls.push(structuredClone(request));
+    await this.onRun?.(request);
     if (this.result instanceof Error) throw this.result;
     return this.result;
   }
@@ -43,7 +45,12 @@ const input = (): TitleProviderInput => ({
 
 describe("CodexTitleProvider", () => {
   test("ephemeralな子Codexへ安全な引数・環境・日本語promptを渡す", async () => {
-    const runner = new FakeRunner();
+    let workspaceExistedDuringRun = false;
+    let workspaceEntriesDuringRun: string[] = [];
+    const runner = new FakeRunner(undefined, async (request) => {
+      workspaceExistedDuringRun = await pathExists(request.cwd);
+      workspaceEntriesDuringRun = await readdir(request.cwd);
+    });
     const baseEnv = {
       PATH: "/test/bin",
       HOME: "/test/home",
@@ -72,6 +79,7 @@ describe("CodexTitleProvider", () => {
       "--model",
       "gpt-5.6-luna",
       "--ephemeral",
+      "--ignore-user-config",
       "--disable",
       "hooks",
       "--ignore-rules",
@@ -81,20 +89,25 @@ describe("CodexTitleProvider", () => {
       "shell_tool",
       "--disable",
       "remote_plugin",
+      "--disable",
+      "apps",
+      "--disable",
+      "plugins",
       "-c",
       'web_search="disabled"',
       "-c",
       "agents.enabled=false",
-      "-c",
-      "mcp_servers={}",
-      "-c",
-      "plugins={}",
       "-c",
       "tools.view_image=false",
       "-c",
       'approval_policy="never"',
       "-",
     ]);
+    expect(isAbsolute(call.cwd)).toBe(true);
+    expect(call.cwd.startsWith(join(tmpdir(), "titlize-title-"))).toBe(true);
+    expect(workspaceExistedDuringRun).toBe(true);
+    expect(workspaceEntriesDuringRun).toEqual([]);
+    expect(await pathExists(call.cwd)).toBe(false);
     expect(call.env).toEqual({
       PATH: "/test/bin",
       HOME: "/test/home",
@@ -187,6 +200,7 @@ describe("CodexTitleProvider", () => {
     const rejection = provider.generateTitle(input());
     await expect(rejection).rejects.toBeInstanceOf(TitleProviderError);
     await expect(rejection).rejects.not.toThrow(/secret|17|137/);
+    expect(await pathExists(runner.calls[0]!.cwd)).toBe(false);
   });
 
   test("runner例外のcause・秘密・パスを公開しない", async () => {
@@ -200,6 +214,42 @@ describe("CodexTitleProvider", () => {
       expect(error).toBeInstanceOf(TitleProviderError);
       expect(String(error)).not.toMatch(/api-secret|private|sensitive|path/);
       expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
+      expect(await pathExists(runner.calls[0]!.cwd)).toBe(false);
+    }
+  });
+
+  test.each([
+    ["成功候補", new FakeRunner(), "resolve"],
+    ["runner例外", new FakeRunner(new Error("runner-secret")), "reject"],
+  ] as const)("一時workspace cleanup失敗で%sを上書きしない", async (_name, runner, outcome) => {
+    const workspace = await mkdtemp(join(tmpdir(), "titlize-title-cleanup-error-"));
+    let cleanupCalls = 0;
+    const provider = new CodexTitleProvider({
+      model: "model",
+      timeoutMs: 100,
+      runner,
+      baseEnv: {},
+      temporaryWorkspaceFactory: async () => ({
+        cwd: workspace,
+        cleanup: async () => {
+          cleanupCalls += 1;
+          throw new Error("cleanup-secret");
+        },
+      }),
+    });
+
+    try {
+      if (outcome === "resolve") {
+        await expect(provider.generateTitle(input())).resolves.toBe("認証エラーの原因調査");
+      } else {
+        const rejection = provider.generateTitle(input());
+        await expect(rejection).rejects.toBeInstanceOf(TitleProviderError);
+        await expect(rejection).rejects.not.toThrow(/cleanup-secret|runner-secret/);
+      }
+      expect(cleanupCalls).toBe(1);
+      expect(runner.calls[0]!.cwd).toBe(workspace);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
     }
   });
 
@@ -395,6 +445,101 @@ describe("createProcessTreeKiller", () => {
   });
 });
 
+describe("Codex CLI configuration isolation contract", () => {
+  test("0.145.0のignore-user-configはuser configを読まず同じCODEX_HOMEのauthを使う", async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-codex-contract-"));
+    const fakeHome = join(temporaryDirectory, "home");
+    const fakeCodexHome = join(temporaryDirectory, "codex-home");
+    const hostileProject = join(temporaryDirectory, "hostile-project");
+    const isolatedWorkspace = join(temporaryDirectory, "isolated-workspace");
+    const userSecret = "user-config-contract-secret";
+    const projectSecret = "project-config-contract-secret";
+    const authSecret = "auth-contract-secret";
+
+    try {
+      await mkdir(join(hostileProject, ".codex"), { recursive: true });
+      await mkdir(fakeCodexHome, { recursive: true });
+      await mkdir(fakeHome, { recursive: true });
+      await mkdir(isolatedWorkspace, { recursive: true });
+      await writeFile(
+        join(fakeCodexHome, "config.toml"),
+        `[mcp_servers.user_contract]\ncommand = ${JSON.stringify(userSecret)}\n\n[features]\napps = true\nplugins = true\n`,
+      );
+      await writeFile(
+        join(fakeCodexHome, "auth.json"),
+        JSON.stringify({ OPENAI_API_KEY: authSecret }),
+      );
+      await writeFile(
+        join(hostileProject, ".codex", "config.toml"),
+        `[mcp_servers.project_contract]\ncommand = ${JSON.stringify(projectSecret)}\n`,
+      );
+
+      const childEnv = {
+        PATH: process.env.PATH,
+        HOME: fakeHome,
+        CODEX_HOME: fakeCodexHome,
+        TMPDIR: temporaryDirectory,
+        LANG: process.env.LANG,
+      };
+      // --help and --version only parse the installed CLI contract; they never start a model turn.
+      const help = Bun.spawnSync(
+        ["codex", "exec", "--ignore-user-config", "--disable", "apps", "--disable", "plugins", "--help"],
+        {
+          cwd: isolatedWorkspace,
+          env: childEnv,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      const version = Bun.spawnSync(["codex", "--version"], {
+        cwd: isolatedWorkspace,
+        env: childEnv,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const features = Bun.spawnSync(
+        ["codex", "features", "list", "--disable", "apps", "--disable", "plugins"],
+        {
+          cwd: isolatedWorkspace,
+          env: childEnv,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      const helpOutput = new TextDecoder().decode(help.stdout);
+      const versionOutput = new TextDecoder().decode(version.stdout);
+      const featuresOutput = new TextDecoder().decode(features.stdout);
+      const allOutput = [
+        helpOutput,
+        new TextDecoder().decode(help.stderr),
+        versionOutput,
+        new TextDecoder().decode(version.stderr),
+        featuresOutput,
+        new TextDecoder().decode(features.stderr),
+      ].join("\n");
+
+      expect(help.exitCode).toBe(0);
+      expect(version.exitCode).toBe(0);
+      expect(features.exitCode).toBe(0);
+      expect(versionOutput).toContain("codex-cli 0.145.0");
+      expect(helpOutput).toContain("--ignore-user-config");
+      expect(helpOutput.replace(/\s+/g, " ")).toContain(
+        "Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`",
+      );
+      expect(helpOutput).toContain("--disable <FEATURE>");
+      expect(featuresOutput).toMatch(/^apps\s+stable\s+false$/m);
+      expect(featuresOutput).toMatch(/^plugins\s+stable\s+false$/m);
+      expect(allOutput).not.toMatch(/user-config-contract-secret|project-config-contract-secret|auth-contract-secret/);
+      expect(await readdir(isolatedWorkspace)).toEqual([]);
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("BunCommandRunner", () => {
   const bunRunner = () => new BunCommandRunner(process.execPath);
   const request = (script: string, overrides: Partial<CommandRunRequest> = {}): CommandRunRequest => ({
@@ -402,6 +547,7 @@ describe("BunCommandRunner", () => {
     env: { PATH: process.env.PATH, TEST_RUNNER_VALUE: "inherited" },
     stdin: "runner-input",
     timeoutMs: 5_000,
+    cwd: process.cwd(),
     ...overrides,
   });
 
@@ -413,6 +559,43 @@ describe("BunCommandRunner", () => {
     );
 
     expect(result).toEqual({ exitCode: 0, stdout: "inherited:runner-input", timedOut: false });
+  });
+
+  test("指定した絶対cwdで実processを起動する", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "titlize-runner-cwd-"));
+    try {
+      const canonicalWorkspace = await realpath(workspace);
+      const result = await bunRunner().run(
+        request("process.stdout.write(process.cwd());", { cwd: canonicalWorkspace }),
+      );
+
+      expect(result).toEqual({ exitCode: 0, stdout: canonicalWorkspace, timedOut: false });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ["空文字", ""],
+    ["相対path", "relative-cwd-secret"],
+    ["NUL含有", `${tmpdir()}/nul\0cwd-secret`],
+    ["非文字列", 42],
+  ] as const)("不正cwdをspawn前に安全に拒否する: %s", async (_name, invalidCwd) => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-runner-invalid-cwd-"));
+    const markerFile = join(temporaryDirectory, "spawned");
+    try {
+      const rejection = bunRunner().run(
+        request(`await Bun.write(${JSON.stringify(markerFile)}, "spawned");`, {
+          cwd: invalidCwd as string,
+        }),
+      );
+
+      await expect(rejection).rejects.toBeInstanceOf(TitleProviderError);
+      await expect(rejection).rejects.not.toThrow(/relative-cwd-secret|cwd-secret|spawned/);
+      expect(await Bun.file(markerFile).exists()).toBe(false);
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
   });
 
   test("同時runでもlifecycle listenerは1組だけ登録し、完了後に解除する", async () => {
@@ -601,6 +784,7 @@ describe("BunCommandRunner", () => {
         return stdinReads < 3 ? "safe" : "x".repeat(8 * 1024 * 1024 + 1);
       },
       timeoutMs: 5_000,
+      cwd: process.cwd(),
     };
 
     try {
@@ -647,6 +831,15 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
     await Bun.sleep(10);
   }
   return false;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function readTreePids(

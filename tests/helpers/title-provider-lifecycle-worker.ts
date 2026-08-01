@@ -30,6 +30,7 @@ const runPromise = new BunCommandRunner(process.execPath).run({
   env: { PATH: process.env.PATH, TITLE_PID_FILE: pidFile },
   stdin: "",
   timeoutMs: 20_000,
+  cwd: process.cwd(),
 });
 
 if (mode === "host-signal") {
