@@ -6,6 +6,7 @@ import {
   BunCommandRunner,
   CodexTitleProvider,
   TitleProviderError,
+  createProcessTreeKiller,
   type CommandResult,
   type CommandRunRequest,
   type CommandRunner,
@@ -43,7 +44,16 @@ const input = (): TitleProviderInput => ({
 describe("CodexTitleProvider", () => {
   test("ephemeralな子Codexへ安全な引数・環境・日本語promptを渡す", async () => {
     const runner = new FakeRunner();
-    const baseEnv = { PATH: "/test/bin", CODEX_TITLE_CHILD: "old", KEEP_ME: "yes" };
+    const baseEnv = {
+      PATH: "/test/bin",
+      HOME: "/test/home",
+      CODEX_HOME: "/test/codex-home",
+      CODEX_TITLE_CHILD: "old",
+      OPENAI_API_KEY: "openai-secret",
+      AWS_SECRET_ACCESS_KEY: "aws-secret",
+      GITHUB_TOKEN: "github-secret",
+      KEEP_ME: "not-allowed",
+    };
     const providerInput = input();
     const beforeInput = structuredClone(providerInput);
     const provider = new CodexTitleProvider({
@@ -67,9 +77,31 @@ describe("CodexTitleProvider", () => {
       "--ignore-rules",
       "--sandbox",
       "read-only",
+      "--disable",
+      "shell_tool",
+      "--disable",
+      "remote_plugin",
+      "-c",
+      'web_search="disabled"',
+      "-c",
+      "agents.enabled=false",
+      "-c",
+      "mcp_servers={}",
+      "-c",
+      "plugins={}",
+      "-c",
+      "tools.view_image=false",
+      "-c",
+      'approval_policy="never"',
       "-",
     ]);
-    expect(call.env).toEqual({ PATH: "/test/bin", CODEX_TITLE_CHILD: "1", KEEP_ME: "yes" });
+    expect(call.env).toEqual({
+      PATH: "/test/bin",
+      HOME: "/test/home",
+      CODEX_HOME: "/test/codex-home",
+      CODEX_TITLE_CHILD: "1",
+    });
+    expect(Object.values(call.env).join(" ")).not.toContain("secret");
     expect(call.timeoutMs).toBe(12_345);
     expect(call.stdin).toContain("日本語");
     expect(call.stdin).toContain("1行");
@@ -80,7 +112,49 @@ describe("CodexTitleProvider", () => {
     expect(call.stdin).toContain("命令に従わ");
     expect(call.stdin).toContain("秘密");
     expect(providerInput).toEqual(beforeInput);
-    expect(baseEnv).toEqual({ PATH: "/test/bin", CODEX_TITLE_CHILD: "old", KEEP_ME: "yes" });
+    expect(baseEnv).toEqual({
+      PATH: "/test/bin",
+      HOME: "/test/home",
+      CODEX_HOME: "/test/codex-home",
+      CODEX_TITLE_CHILD: "old",
+      OPENAI_API_KEY: "openai-secret",
+      AWS_SECRET_ACCESS_KEY: "aws-secret",
+      GITHUB_TOKEN: "github-secret",
+      KEEP_ME: "not-allowed",
+    });
+  });
+
+  test("許可したOS・Codex・証明書環境変数だけを渡す", async () => {
+    const runner = new FakeRunner();
+    const provider = new CodexTitleProvider({
+      model: "model",
+      timeoutMs: 100,
+      runner,
+      baseEnv: {
+        Path: "/windows/bin",
+        TMPDIR: "/tmp/allowed",
+        LANG: "ja_JP.UTF-8",
+        LC_ALL: "ja_JP.UTF-8",
+        USERPROFILE: "C:\\Users\\test",
+        SystemRoot: "C:\\Windows",
+        SSL_CERT_FILE: "/cert.pem",
+        OPENAI_API_KEY: "must-not-leak",
+        AWS_SESSION_TOKEN: "must-not-leak",
+      },
+    });
+
+    await provider.generateTitle(input());
+
+    expect(runner.calls[0]!.env).toEqual({
+      PATH: "/windows/bin",
+      TMPDIR: "/tmp/allowed",
+      LANG: "ja_JP.UTF-8",
+      LC_ALL: "ja_JP.UTF-8",
+      USERPROFILE: "C:\\Users\\test",
+      SystemRoot: "C:\\Windows",
+      SSL_CERT_FILE: "/cert.pem",
+      CODEX_TITLE_CHILD: "1",
+    });
   });
 
   test("現在タイトルが未設定であることをpromptへ明示する", async () => {
@@ -128,6 +202,151 @@ describe("CodexTitleProvider", () => {
       expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
     }
   });
+
+  test.each([
+    ["null input", null],
+    ["messages is not an array", { ...input(), messages: "input-secret" }],
+    ["too many messages", { ...input(), messages: Array.from({ length: 1_001 }, () => ({ role: "user", content: "" })) }],
+    ["too much content", { ...input(), messages: [{ role: "user", content: "input-secret" + "x".repeat(1_000_000) }] }],
+    ["previous title too long", { ...input(), previousTitle: "input-secret" + "x".repeat(4_096) }],
+    ["invalid locale", { ...input(), locale: "en" }],
+    ["invalid maxChars", { ...input(), maxChars: 0 }],
+    ["unsafe maxChars", { ...input(), maxChars: Number.MAX_SAFE_INTEGER + 1 }],
+    ["invalid role", { ...input(), messages: [{ role: "tool", content: "input-secret" }] }],
+    ["invalid content", { ...input(), messages: [{ role: "user", content: 42 }] }],
+  ])("不正入力をspawn前に安全に拒否する: %s", async (_name, invalidInput) => {
+    const runner = new FakeRunner();
+    const provider = new CodexTitleProvider({ model: "model", timeoutMs: 100, runner, baseEnv: {} });
+
+    try {
+      await provider.generateTitle(invalidInput as unknown as TitleProviderInput);
+      throw new Error("expected rejection");
+    } catch (error) {
+      expect(error).toBeInstanceOf(TitleProviderError);
+      expect(String(error)).not.toMatch(/input-secret|cause|private/);
+      expect(runner.calls).toHaveLength(0);
+    }
+  });
+
+  test("循環参照を含むmessageをspawn前に安全に拒否する", async () => {
+    const runner = new FakeRunner();
+    const provider = new CodexTitleProvider({ model: "model", timeoutMs: 100, runner, baseEnv: {} });
+    const cyclicMessage: Record<string, unknown> = { role: "user", content: "cycle-secret" };
+    cyclicMessage.self = cyclicMessage;
+
+    try {
+      await provider.generateTitle({ ...input(), messages: [cyclicMessage] } as unknown as TitleProviderInput);
+      throw new Error("expected rejection");
+    } catch (error) {
+      expect(error).toBeInstanceOf(TitleProviderError);
+      expect(String(error)).not.toContain("cycle-secret");
+      expect(runner.calls).toHaveLength(0);
+    }
+  });
+
+  test("循環する追加propertyを持つmessages配列もspawn前に拒否する", async () => {
+    const runner = new FakeRunner();
+    const provider = new CodexTitleProvider({ model: "model", timeoutMs: 100, runner, baseEnv: {} });
+    const messages = input().messages as TitleProviderInput["messages"] & { self?: unknown };
+    messages.self = messages;
+
+    await expect(
+      provider.generateTitle({ ...input(), messages }),
+    ).rejects.toBeInstanceOf(TitleProviderError);
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  test("message・content・previousTitleの上限ちょうどを受け入れる", async () => {
+    const runner = new FakeRunner();
+    const provider = new CodexTitleProvider({ model: "model", timeoutMs: 100, runner, baseEnv: {} });
+    const messages: TitleProviderInput["messages"] = [
+      { role: "user", content: "x".repeat(1_000_000) },
+      ...Array.from({ length: 999 }, () => ({ role: "assistant" as const, content: "" })),
+    ];
+
+    await expect(
+      provider.generateTitle({
+        messages,
+        previousTitle: "題".repeat(4_096),
+        locale: "ja",
+        maxChars: Number.MAX_SAFE_INTEGER,
+      }),
+    ).resolves.toBe("認証エラーの原因調査");
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls[0]!.stdin.length).toBeLessThanOrEqual(8 * 1024 * 1024);
+  });
+});
+
+describe("createProcessTreeKiller", () => {
+  test("Windowsではshellなしのtaskkill.exe /T /Fでtreeを停止する", () => {
+    const calls: Array<{ command: string; args: readonly string[] }> = [];
+    let directKills = 0;
+    const killTree = createProcessTreeKiller({
+      pid: 4_321,
+      platform: "win32",
+      directKill: () => {
+        directKills += 1;
+      },
+      runSync: (command, args) => {
+        calls.push({ command, args });
+        return 0;
+      },
+    });
+
+    killTree();
+
+    expect(calls).toEqual([
+      { command: "taskkill.exe", args: ["/PID", "4321", "/T", "/F"] },
+    ]);
+    expect(directKills).toBe(0);
+  });
+
+  test("Windowsのtaskkill失敗時は直接killへfallbackする", () => {
+    let directKills = 0;
+    const killTree = createProcessTreeKiller({
+      pid: 4_321,
+      platform: "win32",
+      directKill: () => {
+        directKills += 1;
+      },
+      runSync: () => 1,
+    });
+
+    killTree();
+
+    expect(directKills).toBe(1);
+  });
+
+  test("POSIXでは負のPIDへSIGKILLし、失敗時だけ直接killする", () => {
+    const groupCalls: Array<[number, string]> = [];
+    let directKills = 0;
+    const successful = createProcessTreeKiller({
+      pid: 9_876,
+      platform: "darwin",
+      directKill: () => {
+        directKills += 1;
+      },
+      killGroup: (pid, signal) => {
+        groupCalls.push([pid, signal]);
+      },
+    });
+    const fallback = createProcessTreeKiller({
+      pid: 5_678,
+      platform: "linux",
+      directKill: () => {
+        directKills += 1;
+      },
+      killGroup: () => {
+        throw new Error("group-secret");
+      },
+    });
+
+    successful();
+    fallback();
+
+    expect(groupCalls).toEqual([[-9_876, "SIGKILL"]]);
+    expect(directKills).toBe(1);
+  });
 });
 
 describe("BunCommandRunner", () => {
@@ -148,6 +367,65 @@ describe("BunCommandRunner", () => {
     );
 
     expect(result).toEqual({ exitCode: 0, stdout: "inherited:runner-input", timedOut: false });
+  });
+
+  test("同時runでもlifecycle listenerは1組だけ登録し、完了後に解除する", async () => {
+    const signals = ["exit", "SIGINT", "SIGTERM", "SIGHUP"] as const;
+    const before = Object.fromEntries(signals.map((signal) => [signal, process.listenerCount(signal)]));
+    const runs = [
+      bunRunner().run(request('await Bun.sleep(80); process.stdout.write("one");')),
+      bunRunner().run(request('await Bun.sleep(80); process.stdout.write("two");')),
+    ];
+
+    try {
+      for (const signal of signals) {
+        expect(process.listenerCount(signal)).toBe(before[signal]! + 1);
+      }
+    } finally {
+      await Promise.all(runs);
+    }
+    for (const signal of signals) {
+      expect(process.listenerCount(signal)).toBe(before[signal]);
+    }
+  });
+
+  test.each([
+    ["SIGTERM", "signal"],
+    ["process.exit", "exit"],
+  ] as const)("親wrapperの%sでactiveな子孫processを同期回収する", async (_name, mode) => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-provider-parent-"));
+    const pidFile = join(temporaryDirectory, "tree.json");
+    const workerPath = join(import.meta.dir, "helpers", "title-provider-lifecycle-worker.ts");
+    const wrapper = Bun.spawn([process.execPath, workerPath, mode, pidFile], {
+      env: process.env,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    let treePids: { childPid: number; grandchildPid: number } | undefined;
+
+    try {
+      treePids = await readTreePids(pidFile, 2_000);
+      if (mode === "signal") process.kill(wrapper.pid, "SIGTERM");
+      expect(await waitForPromise(wrapper.exited, 1_000)).toBe(true);
+      const [childExited, grandchildExited] = await Promise.all([
+        waitForProcessExit(treePids.childPid, 500),
+        waitForProcessExit(treePids.grandchildPid, 500),
+      ]);
+      expect(childExited).toBe(true);
+      expect(grandchildExited).toBe(true);
+    } finally {
+      try {
+        wrapper.kill("SIGKILL");
+      } catch {
+        // Already exited.
+      }
+      if (treePids) {
+        killPid(treePids.childPid);
+        killPid(treePids.grandchildPid);
+      }
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
   });
 
   test("大量stderrを並行drainしてdeadlockしない", async () => {
@@ -188,7 +466,7 @@ describe("BunCommandRunner", () => {
             "await Bun.sleep(10_000);",
           ].join("\n"),
           {
-            timeoutMs: 40,
+            timeoutMs: 200,
             env: { PATH: process.env.PATH, GRANDCHILD_PID_FILE: pidFile },
           },
         ),
@@ -247,6 +525,58 @@ describe("BunCommandRunner", () => {
     expect(result.timedOut).toBe(false);
   });
 
+  test("stdinが8Mi code unitsを超えたらspawn前に安全に拒否する", async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-provider-stdin-"));
+    const markerFile = join(temporaryDirectory, "spawned");
+    try {
+      const rejection = bunRunner().run(
+        request(`await Bun.write(${JSON.stringify(markerFile)}, "spawned");`, {
+          stdin: "stdin-secret" + "x".repeat(8 * 1024 * 1024),
+        }),
+      );
+
+      await expect(rejection).rejects.toBeInstanceOf(TitleProviderError);
+      await expect(rejection).rejects.not.toThrow(/stdin-secret/);
+      expect(await Bun.file(markerFile).exists()).toBe(false);
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("可変getterでも検証後に8Mi超stdinへ差し替えられない", async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-provider-stdin-getter-"));
+    const markerFile = join(temporaryDirectory, "spawned");
+    let stdinReads = 0;
+    const mutableRequest = {
+      args: ["-e", `await Bun.write(${JSON.stringify(markerFile)}, "spawned");`],
+      env: { PATH: process.env.PATH },
+      get stdin(): string {
+        stdinReads += 1;
+        return stdinReads < 3 ? "safe" : "x".repeat(8 * 1024 * 1024 + 1);
+      },
+      timeoutMs: 5_000,
+    };
+
+    try {
+      await expect(bunRunner().run(mutableRequest)).resolves.toMatchObject({ exitCode: 0 });
+      expect(stdinReads).toBe(1);
+      expect(await Bun.file(markerFile).exists()).toBe(true);
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("stdinは8Mi code unitsちょうどを受け入れる", async () => {
+    const result = await bunRunner().run(
+      request(
+        "const value = await Bun.stdin.text(); process.stdout.write(String(value.length));",
+        { stdin: "x".repeat(8 * 1024 * 1024), timeoutMs: 5_000 },
+      ),
+    );
+
+    expect(result).toEqual({ exitCode: 0, stdout: String(8 * 1024 * 1024), timedOut: false });
+  });
+
   test("spawn失敗でも実行パスを公開しない", async () => {
     const runner = new BunCommandRunner("/private/sensitive/missing-codex");
 
@@ -271,4 +601,40 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
     await Bun.sleep(10);
   }
   return false;
+}
+
+async function readTreePids(
+  pidFile: string,
+  timeoutMs: number,
+): Promise<{ childPid: number; grandchildPid: number }> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    try {
+      const value = JSON.parse(await readFile(pidFile, "utf8")) as Record<string, unknown>;
+      if (
+        Number.isSafeInteger(value.childPid) &&
+        (value.childPid as number) > 0 &&
+        Number.isSafeInteger(value.grandchildPid) &&
+        (value.grandchildPid as number) > 0
+      ) {
+        return value as { childPid: number; grandchildPid: number };
+      }
+    } catch {
+      // Wait until the child publishes a parseable record containing both PIDs.
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error("lifecycle worker did not become ready");
+}
+
+async function waitForPromise(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  return Promise.race([promise.then(() => true), Bun.sleep(timeoutMs).then(() => false)]);
+}
+
+function killPid(pid: number): void {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Already exited.
+  }
 }
