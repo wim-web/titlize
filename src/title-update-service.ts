@@ -129,13 +129,18 @@ export class TitleUpdateService {
           );
           return { status: "unchanged" };
         }
-        if (toStoredTitle(currentTitle) === state.pendingPreviousTitle) {
+        if (
+          state.pendingPreviousTitleKnown &&
+          toStoredTitle(currentTitle) === state.pendingPreviousTitle
+        ) {
           if (state.autoUpdateDisabled) {
             this.writeState("markAutoUpdateDisabled", request.sessionId);
             return { status: "disabled" };
           }
           this.writeState("clearTitleWritePending", request.sessionId);
         } else {
+          // A candidate-only legacy intent with no reconstructable baseline is
+          // intentionally stopped here instead of risking a manual-title overwrite.
           this.writeState("markAutoUpdateDisabled", request.sessionId);
           return { status: state.autoUpdateDisabled ? "disabled" : "manual-change" };
         }
@@ -361,6 +366,7 @@ function snapshotSessionState(value: unknown, expectedSessionId: string): Sessio
     "lastAutoTitle",
     "pendingTitle",
     "pendingPreviousTitle",
+    "pendingPreviousTitleKnown",
     "autoUpdateDisabled",
     "lastSuccessAt",
     "updatedAt",
@@ -374,6 +380,7 @@ function snapshotSessionState(value: unknown, expectedSessionId: string): Sessio
   const lastAutoTitle = value.lastAutoTitle;
   const pendingTitle = value.pendingTitle;
   const pendingPreviousTitle = value.pendingPreviousTitle;
+  const pendingPreviousTitleKnown = value.pendingPreviousTitleKnown;
   const autoUpdateDisabled = value.autoUpdateDisabled;
   const lastSuccessAt = value.lastSuccessAt;
   const updatedAt = value.updatedAt;
@@ -387,7 +394,10 @@ function snapshotSessionState(value: unknown, expectedSessionId: string): Sessio
     !isNullableString(lastAutoTitle) ||
     !isNullableString(pendingTitle) ||
     !isNullableString(pendingPreviousTitle) ||
-    (pendingTitle === null && pendingPreviousTitle !== null) ||
+    typeof pendingPreviousTitleKnown !== "boolean" ||
+    (pendingTitle === null &&
+      (pendingPreviousTitle !== null || pendingPreviousTitleKnown)) ||
+    (!pendingPreviousTitleKnown && pendingPreviousTitle !== null) ||
     typeof autoUpdateDisabled !== "boolean" ||
     !isNullableString(lastSuccessAt) ||
     typeof updatedAt !== "string"
@@ -403,6 +413,7 @@ function snapshotSessionState(value: unknown, expectedSessionId: string): Sessio
     lastAutoTitle,
     pendingTitle,
     pendingPreviousTitle,
+    pendingPreviousTitleKnown,
     autoUpdateDisabled,
     lastSuccessAt,
     updatedAt,

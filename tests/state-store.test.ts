@@ -40,6 +40,7 @@ describe("StateStore", () => {
         lastAutoTitle: null,
         pendingTitle: null,
         pendingPreviousTitle: null,
+        pendingPreviousTitleKnown: false,
         autoUpdateDisabled: false,
         lastSuccessAt: null,
         updatedAt: "2026-08-01T00:00:00.000Z",
@@ -144,7 +145,8 @@ describe("StateStore", () => {
     const { store } = openStore();
     expect(store.markPending("new", "now")).toEqual({
       sessionId: "new", stopCount: 0, lastTurnId: null, pendingUpdate: true,
-      lastAutoTitle: null, pendingTitle: null, pendingPreviousTitle: null, autoUpdateDisabled: false,
+      lastAutoTitle: null, pendingTitle: null, pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false, autoUpdateDisabled: false,
       lastSuccessAt: null, updatedAt: "now",
     });
     store.markSuccess("new", "old title", "success");
@@ -169,7 +171,8 @@ describe("StateStore", () => {
 
     expect(store.markForcedSuccess("new", "forced", "forced-at")).toEqual({
       sessionId: "new", stopCount: 0, lastTurnId: null, pendingUpdate: false,
-      lastAutoTitle: "forced", pendingTitle: null, pendingPreviousTitle: null, autoUpdateDisabled: false,
+      lastAutoTitle: "forced", pendingTitle: null, pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false, autoUpdateDisabled: false,
       lastSuccessAt: "forced-at", updatedAt: "forced-at",
     });
   });
@@ -206,6 +209,7 @@ describe("StateStore", () => {
         pendingUpdate: true,
         pendingTitle: "candidate",
         pendingPreviousTitle: "before",
+        pendingPreviousTitleKnown: true,
         lastAutoTitle: "old",
         updatedAt: "intent",
       }),
@@ -214,6 +218,7 @@ describe("StateStore", () => {
       pendingUpdate: true,
       pendingTitle: "candidate",
       pendingPreviousTitle: "before",
+      pendingPreviousTitleKnown: true,
       lastAutoTitle: "old",
       updatedAt: "retry",
     }));
@@ -231,6 +236,7 @@ describe("StateStore", () => {
       pendingUpdate: true,
       pendingTitle: "candidate",
       pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: true,
       lastAutoTitle: "old",
     }));
   });
@@ -243,6 +249,7 @@ describe("StateStore", () => {
       pendingUpdate: true,
       pendingTitle: null,
       pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false,
       updatedAt: "clear",
     }));
   });
@@ -258,6 +265,7 @@ describe("StateStore", () => {
     expect(finish(store)).toEqual(expect.objectContaining({
       pendingTitle: null,
       pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false,
     }));
   });
 
@@ -297,6 +305,7 @@ describe("StateStore", () => {
       lastAutoTitle: "legacy-title",
       pendingTitle: null,
       pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false,
       autoUpdateDisabled: false,
       lastSuccessAt: "legacy-success",
       updatedAt: "legacy-updated",
@@ -307,6 +316,7 @@ describe("StateStore", () => {
         stopCount: 7,
         pendingTitle: "new-title",
         pendingPreviousTitle: "legacy-title",
+        pendingPreviousTitleKnown: true,
       }),
     );
   });
@@ -331,26 +341,91 @@ describe("StateStore", () => {
         turn_id TEXT NOT NULL,
         PRIMARY KEY(session_id, turn_id)
       );
-      INSERT INTO sessions VALUES (
-        'legacy-intent', 3, 't3', 1, NULL, 'candidate', 0, NULL, 'legacy-updated'
-      );
+      INSERT INTO sessions VALUES
+        ('legacy-known', 3, 't3', 1, 'A', 'candidate-b', 0, NULL, 'known-updated'),
+        ('legacy-unknown', 5, 't5', 1, NULL, 'candidate-c', 0, NULL, 'unknown-updated');
     `);
     legacy.close();
 
     const store = openStore(path).store;
 
-    expect(store.getSession("legacy-intent")).toEqual({
-      sessionId: "legacy-intent",
+    expect(store.getSession("legacy-known")).toEqual({
+      sessionId: "legacy-known",
       stopCount: 3,
       lastTurnId: "t3",
       pendingUpdate: true,
-      lastAutoTitle: null,
-      pendingTitle: "candidate",
-      pendingPreviousTitle: null,
+      lastAutoTitle: "A",
+      pendingTitle: "candidate-b",
+      pendingPreviousTitle: "A",
+      pendingPreviousTitleKnown: true,
       autoUpdateDisabled: false,
       lastSuccessAt: null,
-      updatedAt: "legacy-updated",
+      updatedAt: "known-updated",
     });
+    expect(store.getSession("legacy-unknown")).toEqual({
+      sessionId: "legacy-unknown",
+      stopCount: 5,
+      lastTurnId: "t5",
+      pendingUpdate: true,
+      lastAutoTitle: null,
+      pendingTitle: "candidate-c",
+      pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false,
+      autoUpdateDisabled: false,
+      lastSuccessAt: null,
+      updatedAt: "unknown-updated",
+    });
+  });
+
+  test("known列のない前世代schemaも復元可能なbaselineだけを既知としてmigrationする", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "titlize-state-previous-")), "state.sqlite3");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE sessions (
+        session_id TEXT PRIMARY KEY,
+        stop_count INTEGER NOT NULL,
+        last_turn_id TEXT,
+        pending_update INTEGER NOT NULL,
+        last_auto_title TEXT,
+        pending_title TEXT,
+        pending_previous_title TEXT,
+        auto_update_disabled INTEGER NOT NULL,
+        last_success_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE processed_turns (
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        PRIMARY KEY(session_id, turn_id)
+      );
+      INSERT INTO sessions VALUES
+        ('backfilled', 7, 't7', 1, 'A', 'B', NULL, 0, NULL, 'backfilled-at'),
+        ('preserved', 8, 't8', 1, 'A', 'B', 'M', 1, NULL, 'preserved-at'),
+        ('unknown', 9, 't9', 1, NULL, 'B', NULL, 0, NULL, 'unknown-at');
+    `);
+    legacy.close();
+
+    const store = openStore(path).store;
+
+    expect(store.getSession("backfilled")).toEqual(expect.objectContaining({
+      stopCount: 7,
+      pendingTitle: "B",
+      pendingPreviousTitle: "A",
+      pendingPreviousTitleKnown: true,
+    }));
+    expect(store.getSession("preserved")).toEqual(expect.objectContaining({
+      stopCount: 8,
+      pendingTitle: "B",
+      pendingPreviousTitle: "M",
+      pendingPreviousTitleKnown: true,
+      autoUpdateDisabled: true,
+    }));
+    expect(store.getSession("unknown")).toEqual(expect.objectContaining({
+      stopCount: 9,
+      pendingTitle: "B",
+      pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false,
+    }));
   });
 
   test("close 後の DB 操作は閉鎖済み接続として失敗する", () => {

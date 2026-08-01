@@ -1,4 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { StateStore } from "../src/state-store";
 import {
   TitleUpdateError,
   TitleUpdateService,
@@ -23,6 +28,7 @@ function session(overrides: Partial<SessionState> = {}): SessionState {
     lastAutoTitle: null,
     pendingTitle: null,
     pendingPreviousTitle: null,
+    pendingPreviousTitleKnown: false,
     autoUpdateDisabled: false,
     lastSuccessAt: null,
     updatedAt: "before",
@@ -68,6 +74,7 @@ class FakeStore implements TitleUpdateStateStore {
       lastAutoTitle: title,
       pendingTitle: null,
       pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false,
       lastSuccessAt: now,
       updatedAt: now,
     });
@@ -82,6 +89,7 @@ class FakeStore implements TitleUpdateStateStore {
       lastAutoTitle: title,
       pendingTitle: null,
       pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false,
       autoUpdateDisabled: false,
       lastSuccessAt: now,
       updatedAt: now,
@@ -96,6 +104,7 @@ class FakeStore implements TitleUpdateStateStore {
       pendingUpdate: false,
       pendingTitle: null,
       pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false,
       autoUpdateDisabled: true,
       updatedAt: now,
     });
@@ -114,6 +123,7 @@ class FakeStore implements TitleUpdateStateStore {
       pendingUpdate: true,
       pendingTitle: title,
       pendingPreviousTitle: previousTitle,
+      pendingPreviousTitleKnown: true,
       updatedAt: now,
     });
     return structuredClone(this.state);
@@ -126,6 +136,7 @@ class FakeStore implements TitleUpdateStateStore {
       pendingUpdate: true,
       pendingTitle: null,
       pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: false,
       updatedAt: now,
     });
     return structuredClone(this.state);
@@ -139,6 +150,7 @@ class FakeStore implements TitleUpdateStateStore {
       lastAutoTitle: this.state?.lastAutoTitle ?? null,
       pendingTitle: this.state?.pendingTitle ?? null,
       pendingPreviousTitle: this.state?.pendingPreviousTitle ?? null,
+      pendingPreviousTitleKnown: this.state?.pendingPreviousTitleKnown ?? false,
       autoUpdateDisabled: this.state?.autoUpdateDisabled ?? false,
       lastSuccessAt: this.state?.lastSuccessAt ?? null,
       ...overrides,
@@ -227,6 +239,80 @@ async function waitForCall(calls: string[], expected: string): Promise<void> {
     await Promise.resolve();
   }
   throw new Error(`Timed out waiting for ${expected}`);
+}
+
+function openIntermediateIntentStore(options: {
+  sessionId: string;
+  lastAutoTitle: string | null;
+  pendingTitle: string;
+}): StateStore {
+  const path = join(mkdtempSync(join(tmpdir(), "titlize-intermediate-")), "state.sqlite3");
+  const legacy = new Database(path);
+  try {
+    legacy.exec(`
+      CREATE TABLE sessions (
+        session_id TEXT PRIMARY KEY,
+        stop_count INTEGER NOT NULL,
+        last_turn_id TEXT,
+        pending_update INTEGER NOT NULL,
+        last_auto_title TEXT,
+        pending_title TEXT,
+        auto_update_disabled INTEGER NOT NULL,
+        last_success_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE processed_turns (
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        PRIMARY KEY(session_id, turn_id)
+      );
+    `);
+    legacy.query(
+      `INSERT INTO sessions VALUES (?, 3, 't3', 1, ?, ?, 0, NULL, 'legacy-updated')`,
+    ).run(options.sessionId, options.lastAutoTitle, options.pendingTitle);
+  } finally {
+    legacy.close();
+  }
+  return new StateStore(path);
+}
+
+function migratedStoreHarness(
+  store: StateStore,
+  currentTitleRef: { value: string | undefined },
+  candidate: string,
+) {
+  const calls: string[] = [];
+  const service = new TitleUpdateService({
+    store,
+    provider: {
+      async generateTitle() {
+        calls.push("generateTitle");
+        return candidate;
+      },
+    },
+    transcriptReader: {
+      async read() {
+        calls.push("readTranscript");
+        return structuredClone(MESSAGES);
+      },
+    },
+    sink: {
+      async readTitle() {
+        calls.push("readTitle");
+        return currentTitleRef.value;
+      },
+      async readConversation() {
+        throw new Error("unexpected conversation read");
+      },
+      async setTitle(_sessionId, title) {
+        calls.push("setTitle");
+        currentTitleRef.value = title;
+      },
+    },
+    maxChars: 40,
+    clock: () => NOW,
+  });
+  return { service, calls };
 }
 
 describe("TitleUpdateService", () => {
@@ -540,6 +626,7 @@ describe("TitleUpdateService", () => {
         lastAutoTitle: "A",
         pendingTitle: "B",
         pendingPreviousTitle: "A",
+        pendingPreviousTitleKnown: true,
         pendingUpdate: true,
       }),
       currentTitle: "M",
@@ -566,6 +653,7 @@ describe("TitleUpdateService", () => {
         lastAutoTitle: null,
         pendingTitle: "B",
         pendingPreviousTitle: "既存タイトル",
+        pendingPreviousTitleKnown: true,
         pendingUpdate: true,
       }),
       currentTitle: "既存タイトル",
@@ -645,6 +733,118 @@ describe("TitleUpdateService", () => {
       "setTitle", "markSuccess",
     ]);
     expect(currentTitleRef.value).toBe("B");
+  });
+
+  test("旧DBの未適用intentはlastAutoTitleを変更前名へ復元して再試行する", async () => {
+    const store = openIntermediateIntentStore({
+      sessionId: "legacy-known",
+      lastAutoTitle: "A",
+      pendingTitle: "B",
+    });
+    const currentTitleRef: { value: string | undefined } = { value: "A" };
+    const h = migratedStoreHarness(store, currentTitleRef, "C");
+
+    try {
+      expect(store.getSession("legacy-known")).toEqual(expect.objectContaining({
+        stopCount: 3,
+        lastTurnId: "t3",
+        pendingTitle: "B",
+        pendingPreviousTitle: "A",
+        pendingPreviousTitleKnown: true,
+      }));
+
+      await expect(h.service.update({
+        sessionId: "legacy-known",
+        transcriptPath: TRANSCRIPT_PATH,
+        force: false,
+      })).resolves.toEqual({ status: "updated" });
+
+      expect(h.calls).toEqual([
+        "readTitle", "readTranscript", "generateTitle", "readTitle", "setTitle",
+      ]);
+      expect(currentTitleRef.value).toBe("C");
+      expect(store.getSession("legacy-known")).toEqual(expect.objectContaining({
+        stopCount: 3,
+        lastTurnId: "t3",
+        pendingUpdate: false,
+        pendingTitle: null,
+        pendingPreviousTitle: null,
+        pendingPreviousTitleKnown: false,
+        lastAutoTitle: "C",
+        autoUpdateDisabled: false,
+      }));
+    } finally {
+      store.close();
+    }
+  });
+
+  test("変更前名を復元不能な旧初回intentは手動名を上書きせず停止する", async () => {
+    const store = openIntermediateIntentStore({
+      sessionId: "legacy-unknown",
+      lastAutoTitle: null,
+      pendingTitle: "B",
+    });
+    const currentTitleRef: { value: string | undefined } = { value: "M" };
+    const h = migratedStoreHarness(store, currentTitleRef, "C");
+
+    try {
+      expect(store.getSession("legacy-unknown")).toEqual(expect.objectContaining({
+        pendingTitle: "B",
+        pendingPreviousTitle: null,
+        pendingPreviousTitleKnown: false,
+      }));
+
+      await expect(h.service.update({
+        sessionId: "legacy-unknown",
+        transcriptPath: TRANSCRIPT_PATH,
+        force: false,
+      })).resolves.toEqual({ status: "manual-change" });
+
+      expect(h.calls).toEqual(["readTitle"]);
+      expect(currentTitleRef.value).toBe("M");
+      expect(store.getSession("legacy-unknown")).toEqual(expect.objectContaining({
+        stopCount: 3,
+        lastTurnId: "t3",
+        pendingUpdate: false,
+        pendingTitle: null,
+        pendingPreviousTitle: null,
+        pendingPreviousTitleKnown: false,
+        autoUpdateDisabled: true,
+      }));
+    } finally {
+      store.close();
+    }
+  });
+
+  test("変更前名を復元不能でも旧intent候補が適用済みなら成功回復する", async () => {
+    const store = openIntermediateIntentStore({
+      sessionId: "legacy-applied",
+      lastAutoTitle: null,
+      pendingTitle: "B",
+    });
+    const currentTitleRef: { value: string | undefined } = { value: "B" };
+    const h = migratedStoreHarness(store, currentTitleRef, "unused");
+
+    try {
+      await expect(h.service.update({
+        sessionId: "legacy-applied",
+        transcriptPath: TRANSCRIPT_PATH,
+        force: false,
+      })).resolves.toEqual({ status: "unchanged" });
+
+      expect(h.calls).toEqual(["readTitle"]);
+      expect(store.getSession("legacy-applied")).toEqual(expect.objectContaining({
+        stopCount: 3,
+        lastTurnId: "t3",
+        pendingUpdate: false,
+        pendingTitle: null,
+        pendingPreviousTitleKnown: false,
+        lastAutoTitle: "B",
+        autoUpdateDisabled: false,
+      }));
+    } finally {
+      store.close();
+    }
   });
 
   test("通常更新でTranscriptパスがなければpendingを残しApp Server会話へfallbackしない", async () => {
@@ -893,6 +1093,7 @@ describe("TitleUpdateService", () => {
       ...session(),
       pendingTitle: "candidate",
       pendingPreviousTitle: 42,
+      pendingPreviousTitleKnown: true,
     }) as unknown as SessionState;
 
     const rejection = h.service.update({
@@ -902,6 +1103,23 @@ describe("TitleUpdateService", () => {
     });
     await expect(rejection).rejects.toBeInstanceOf(TitleUpdateError);
     await expect(rejection).rejects.toThrow("title update state operation failed");
+    expect(h.calls).toEqual([]);
+  });
+
+  test("pendingPreviousTitleKnownの不正値を外部処理前に安全なstate errorへ変換する", async () => {
+    const h = harness();
+    h.store.getSession = () => ({
+      ...session(),
+      pendingTitle: "candidate",
+      pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: 1,
+    }) as unknown as SessionState;
+
+    await expect(h.service.update({
+      sessionId: "s1",
+      transcriptPath: TRANSCRIPT_PATH,
+      force: false,
+    })).rejects.toEqual(TitleUpdateError.for("state_failed"));
     expect(h.calls).toEqual([]);
   });
 

@@ -11,6 +11,7 @@ type SessionRow = {
   last_auto_title: string | null;
   pending_title: string | null;
   pending_previous_title: string | null;
+  pending_previous_title_known: number;
   auto_update_disabled: number;
   last_success_at: string | null;
   updated_at: string;
@@ -25,6 +26,8 @@ const schema = `
     last_auto_title TEXT,
     pending_title TEXT,
     pending_previous_title TEXT,
+    pending_previous_title_known INTEGER NOT NULL DEFAULT 0
+      CHECK(pending_previous_title_known IN (0, 1)),
     auto_update_disabled INTEGER NOT NULL CHECK(auto_update_disabled IN (0, 1)),
     last_success_at TEXT,
     updated_at TEXT NOT NULL
@@ -46,6 +49,7 @@ function toSessionState(row: SessionRow): SessionState {
     lastAutoTitle: row.last_auto_title,
     pendingTitle: row.pending_title,
     pendingPreviousTitle: row.pending_previous_title,
+    pendingPreviousTitleKnown: row.pending_previous_title_known === 1,
     autoUpdateDisabled: row.auto_update_disabled === 1,
     lastSuccessAt: row.last_success_at,
     updatedAt: row.updated_at,
@@ -92,8 +96,9 @@ export class StateStore {
         .query(
           `INSERT INTO sessions (
             session_id, stop_count, last_turn_id, pending_update, last_auto_title,
-            pending_title, pending_previous_title, auto_update_disabled, last_success_at, updated_at
-          ) VALUES (?, 0, NULL, 0, NULL, NULL, NULL, 0, NULL, ?)
+            pending_title, pending_previous_title, pending_previous_title_known,
+            auto_update_disabled, last_success_at, updated_at
+          ) VALUES (?, 0, NULL, 0, NULL, NULL, NULL, 0, 0, NULL, ?)
           ON CONFLICT(session_id) DO NOTHING`,
         )
         .run(sessionId, now);
@@ -135,6 +140,7 @@ export class StateStore {
       now,
       `pending_update = 0, last_auto_title = excluded.last_auto_title,
        pending_title = NULL, pending_previous_title = NULL,
+       pending_previous_title_known = 0,
        last_success_at = excluded.last_success_at,
        updated_at = excluded.updated_at`,
       title,
@@ -147,6 +153,7 @@ export class StateStore {
       now,
       `pending_update = 0, last_auto_title = excluded.last_auto_title, auto_update_disabled = 0,
        pending_title = NULL, pending_previous_title = NULL,
+       pending_previous_title_known = 0,
        last_success_at = excluded.last_success_at,
        updated_at = excluded.updated_at`,
       title,
@@ -158,6 +165,7 @@ export class StateStore {
       sessionId,
       now,
       `pending_update = 0, pending_title = NULL, pending_previous_title = NULL,
+       pending_previous_title_known = 0,
        auto_update_disabled = 1,
        updated_at = excluded.updated_at`,
       null,
@@ -177,12 +185,14 @@ export class StateStore {
       now,
       `pending_update = 1, pending_title = excluded.pending_title,
        pending_previous_title = excluded.pending_previous_title,
+       pending_previous_title_known = 1,
        updated_at = excluded.updated_at`,
       null,
       true,
       false,
       title,
       previousTitle,
+      true,
     );
   }
 
@@ -191,6 +201,7 @@ export class StateStore {
       sessionId,
       now,
       `pending_update = 1, pending_title = NULL, pending_previous_title = NULL,
+       pending_previous_title_known = 0,
        updated_at = excluded.updated_at`,
       null,
       true,
@@ -206,13 +217,15 @@ export class StateStore {
     autoUpdateDisabled = false,
     pendingTitle: string | null = null,
     pendingPreviousTitle: string | null = null,
+    pendingPreviousTitleKnown = false,
   ): SessionState {
     this.db
       .query(
         `INSERT INTO sessions (
           session_id, stop_count, last_turn_id, pending_update, last_auto_title,
-          pending_title, pending_previous_title, auto_update_disabled, last_success_at, updated_at
-        ) VALUES (?, 0, NULL, ?, ?, ?, ?, ?, ?, ?)
+          pending_title, pending_previous_title, pending_previous_title_known,
+          auto_update_disabled, last_success_at, updated_at
+        ) VALUES (?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET ${updates}`,
       )
       .run(
@@ -221,6 +234,7 @@ export class StateStore {
         title,
         pendingTitle,
         pendingPreviousTitle,
+        pendingPreviousTitleKnown ? 1 : 0,
         autoUpdateDisabled ? 1 : 0,
         title === null ? null : now,
         now,
@@ -242,6 +256,43 @@ export class StateStore {
       if (!columns.has("pending_previous_title")) {
         this.db.exec("ALTER TABLE sessions ADD COLUMN pending_previous_title TEXT");
       }
+      if (!columns.has("pending_previous_title_known")) {
+        this.db.exec(
+          `ALTER TABLE sessions ADD COLUMN pending_previous_title_known INTEGER NOT NULL
+           DEFAULT 0 CHECK(pending_previous_title_known IN (0, 1))`,
+        );
+      }
+      if (!columns.has("pending_previous_title")) {
+        // Candidate-only legacy intents can use the last owned title as their baseline.
+        // A first intent has no reconstructable baseline and stays unknown (0), so it
+        // cannot later overwrite a possibly manual title.
+        this.db.exec(
+          `UPDATE sessions
+           SET pending_previous_title = last_auto_title,
+               pending_previous_title_known = CASE
+                 WHEN last_auto_title IS NOT NULL THEN 1 ELSE 0
+               END
+           WHERE pending_title IS NOT NULL`,
+        );
+      } else if (!columns.has("pending_previous_title_known")) {
+        // Databases from the previous release have no marker. Preserve an exact
+        // non-null baseline, otherwise use the last owned title when one exists.
+        // Remaining null baselines are treated conservatively as unknown.
+        this.db.exec(
+          `UPDATE sessions
+           SET pending_previous_title = CASE
+                 WHEN pending_title IS NOT NULL AND pending_previous_title IS NULL
+                   THEN last_auto_title
+                 ELSE pending_previous_title
+               END,
+               pending_previous_title_known = CASE
+                 WHEN pending_title IS NOT NULL AND
+                   (pending_previous_title IS NOT NULL OR last_auto_title IS NOT NULL)
+                   THEN 1
+                 ELSE 0
+               END`,
+        );
+      }
       this.db.exec("COMMIT");
       transactionOpen = false;
     } catch (error) {
@@ -258,7 +309,11 @@ export class StateStore {
 
   private hasTitleIntentColumns(): boolean {
     const columns = this.sessionColumnNames();
-    return columns.has("pending_title") && columns.has("pending_previous_title");
+    return (
+      columns.has("pending_title") &&
+      columns.has("pending_previous_title") &&
+      columns.has("pending_previous_title_known")
+    );
   }
 
   private sessionColumnNames(): Set<string> {
