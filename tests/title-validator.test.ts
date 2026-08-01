@@ -64,6 +64,19 @@ describe("validateTitle", () => {
     expect(validateTitle("https://example.test/a**?x=~ok~_`", 60)).toBe("https://example.test/a**?x=~ok~_`");
   });
 
+  test("URL直前後のMarkdown境界だけを分離し、句読点を保持する", () => {
+    expect(validateTitle("***https://example.test/a***", 60)).toBe("https://example.test/a");
+    expect(validateTitle("**https://example.test/a**.", 60)).toBe("https://example.test/a.");
+    expect(validateTitle("See `https://example.test/a`, now", 60)).toBe("See https://example.test/a, now");
+    expect(validateTitle("『「https://example.test/a」』", 60)).toBe("https://example.test/a");
+    expect(validateTitle("**「https://example.test/a」**", 60)).toBe("https://example.test/a");
+  });
+
+  test("孤立backtickを保持し、空の対応backtickだけを拒否する", () => {
+    expect(validateTitle("`", 1)).toBe("`");
+    expect(() => validateTitle("``", 1)).toThrow(TitleValidationError);
+  });
+
   test("括弧を含むリンク先でも表示テキストだけを保持する", () => {
     expect(validateTitle("[label](https://example.test/a_(b))", 40)).toBe("label");
     expect(validateTitle("![alt](https://example.test/a_(b))", 40)).toBe("alt");

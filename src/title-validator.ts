@@ -44,6 +44,7 @@ const quotePairs: ReadonlyArray<readonly [string, string]> = [
 ];
 const wordCharacter = /[\p{L}\p{N}]/u;
 const markdownMarkers = ["**", "__", "~~", "*", "_", "`"];
+const urlWrapperMarkers = ["***", "___", "**", "__", "~~", "*", "_", "`"];
 
 export function validateTitle(raw: string, maxChars: number): string {
   if (!Number.isSafeInteger(maxChars) || maxChars <= 0) {
@@ -80,7 +81,7 @@ export function validateTitle(raw: string, maxChars: number): string {
   title = restorePlaceholders(title, protectedUrls);
   title = restoreBackticks(title, protectedBackticks);
 
-  if (title.length === 0 || /^[*_~`]+$/.test(title)) {
+  if (title.length === 0 || /^[*_~]+$/.test(title)) {
     throw TitleValidationError.empty();
   }
   if (Array.from(title).length > maxChars) {
@@ -161,12 +162,15 @@ function findClosingParenthesis(value: string, start: number): number {
 }
 
 function protectUrls(value: string, placeholders: string[]): string {
-  return value.replace(/https?:\/\/\S+/g, (url, offset: number, input: string) => {
-    const marker = markdownMarkers.find(
-      (candidate) => input.slice(offset - candidate.length, offset) === candidate && url.endsWith(candidate),
-    );
-    if (marker) {
-      return `${placeholder(placeholders, url.slice(0, -marker.length))}${marker}`;
+  return value.replace(/https?:\/\/[^\s"'“”‘’「」『』【】`]+/g, (url, offset: number, input: string) => {
+    const opening = urlWrapperMarkers.find((marker) => input.slice(offset - marker.length, offset) === marker);
+    if (opening) {
+      const punctuation = url.match(/[.,;:!?。、]+$/)?.[0] ?? "";
+      const core = punctuation ? url.slice(0, -punctuation.length) : url;
+      const closing = urlWrapperMarkers.find((marker) => core.endsWith(marker));
+      if (closing === opening) {
+        return `${placeholder(placeholders, core.slice(0, -closing.length))}${closing}${punctuation}`;
+      }
     }
     return placeholder(placeholders, url);
   });
