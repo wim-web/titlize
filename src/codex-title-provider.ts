@@ -293,6 +293,7 @@ export class CodexTitleProvider implements TitleProvider {
             this.model,
             "--ephemeral",
             "--ignore-user-config",
+            "--skip-git-repo-check",
             "--disable",
             "hooks",
             "--ignore-rules",

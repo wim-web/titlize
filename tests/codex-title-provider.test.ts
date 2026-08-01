@@ -80,6 +80,7 @@ describe("CodexTitleProvider", () => {
       "gpt-5.6-luna",
       "--ephemeral",
       "--ignore-user-config",
+      "--skip-git-repo-check",
       "--disable",
       "hooks",
       "--ignore-rules",
@@ -528,6 +529,9 @@ describe("Codex CLI configuration isolation contract", () => {
         /^codex-cli (?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
       );
       expect(helpOutput).toContain("--ignore-user-config");
+      // Current Codex CLI exec source/help defines this as the non-Git startup bypass;
+      // this help-only contract probe never starts a model or makes an API call.
+      expect(helpOutput).toContain("--skip-git-repo-check");
       expect(helpOutput.replace(/\s+/g, " ")).toContain(
         "Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`",
       );
