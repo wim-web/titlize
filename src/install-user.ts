@@ -1,6 +1,6 @@
-import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { buildCli, BuildCliError } from "./build-cli";
 import { installUser, uninstallUser, UserInstallerError } from "./user-installer";
 
 function resolveCodexHome(env: Record<string, string | undefined>): string {
@@ -11,29 +11,12 @@ function resolveCodexHome(env: Record<string, string | undefined>): string {
   return value;
 }
 
-async function buildBundle(repoRoot: string, bunExecutable: string): Promise<string> {
-  const outputPath = join(repoRoot, "dist", "codex-title");
-  await mkdir(join(repoRoot, "dist"), { recursive: true });
-
-  const child = Bun.spawn({
-    cmd: [
-      bunExecutable,
-      "build",
-      join(repoRoot, "src", "cli.ts"),
-      "--target=bun",
-      `--outfile=${outputPath}`,
-    ],
-    cwd: repoRoot,
-    stdin: "ignore",
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-
-  if ((await child.exited) !== 0) {
-    throw new UserInstallerError("bundle_build_failed");
+function resolveBinDirectory(env: Record<string, string | undefined>): string {
+  const value = env.TITLIZE_INSTALL_DIR ?? join(homedir(), ".local", "bin");
+  if (!isAbsolute(value) || value.includes("\0")) {
+    throw new UserInstallerError("install_path_invalid");
   }
-
-  return outputPath;
+  return value;
 }
 
 export async function main(
@@ -42,9 +25,11 @@ export async function main(
 ): Promise<number> {
   try {
     const codexHome = resolveCodexHome(env);
+    const binDirectory = resolveBinDirectory(env);
     if (argv.length === 1 && argv[0] === "--uninstall") {
-      const result = await uninstallUser({ codexHome });
-      console.log(`titlizeを削除しました: ${result.hooksPath}`);
+      const result = await uninstallUser({ codexHome, binDirectory });
+      console.log(`titlize CLIを削除しました: ${result.cliPath}`);
+      console.log(`ユーザー共通Hookを更新しました: ${result.hooksPath}`);
       return 0;
     }
 
@@ -52,20 +37,18 @@ export async function main(
       throw new UserInstallerError("install_arguments_invalid");
     }
 
-    const bunExecutable = Bun.which("bun") ?? process.execPath;
-    if (!isAbsolute(bunExecutable)) {
-      throw new UserInstallerError("bun_not_found");
-    }
-
     const repoRoot = join(import.meta.dir, "..");
-    const bundleSource = await buildBundle(repoRoot, bunExecutable);
-    const result = await installUser({ codexHome, bunExecutable, bundleSource });
-    console.log(`titlizeをインストールしました: ${result.bundlePath}`);
+    const cliSource = await buildCli({ repoRoot });
+    const result = await installUser({ codexHome, binDirectory, cliSource });
+    console.log(`titlize CLIをインストールしました: ${result.cliPath}`);
     console.log(`ユーザー共通Hookを更新しました: ${result.hooksPath}`);
     console.log("Codexで /hooks を開き、titlizeのStop Hookを信頼してください。");
     return 0;
   } catch (error) {
-    const code = error instanceof UserInstallerError ? error.code : "user_install_failed";
+    const code =
+      error instanceof UserInstallerError || error instanceof BuildCliError
+        ? error.code
+        : "user_install_failed";
     console.error(`titlize: ${code}`);
     return 1;
   }

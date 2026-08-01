@@ -6,7 +6,7 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/cli.ts --target=bun --outfile=dist/codex-title",
+    "build": "bun src/build-cli.ts",
     "install:user": "bun src/install-user.ts",
     "uninstall:user": "bun src/install-user.ts --uninstall"
   },

@@ -25,17 +25,18 @@ export class UserInstallerError extends Error {
 
 export interface UserInstallOptions {
   codexHome: string;
-  bunExecutable: string;
-  bundleSource: string;
+  binDirectory: string;
+  cliSource: string;
 }
 
 export interface UserInstallResult {
-  bundlePath: string;
+  cliPath: string;
   hooksPath: string;
 }
 
 export interface UserUninstallOptions {
   codexHome: string;
+  binDirectory: string;
 }
 
 function isObject(value: unknown): value is JsonObject {
@@ -46,8 +47,13 @@ function hasCode(error: unknown, code: string): boolean {
   return isObject(error) && error.code === code;
 }
 
-function validateAbsolutePath(value: string): void {
-  if (value.trim() === "" || value.includes("\0") || !isAbsolute(value)) {
+function validateAbsolutePath(value: unknown): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    value.trim() === "" ||
+    value.includes("\0") ||
+    !isAbsolute(value)
+  ) {
     throw new UserInstallerError("install_path_invalid");
   }
 }
@@ -142,33 +148,35 @@ async function atomicCopy(source: string, destination: string): Promise<void> {
   const temporaryPath = `${destination}.titlize-${process.pid}-${randomUUID()}.tmp`;
   try {
     await copyFile(source, temporaryPath);
-    await chmod(temporaryPath, 0o644);
+    await chmod(temporaryPath, 0o755);
     await rename(temporaryPath, destination);
   } finally {
     await rm(temporaryPath, { force: true }).catch(() => undefined);
   }
 }
 
-function installPaths(codexHome: string): UserInstallResult & { installDirectory: string } {
-  const installDirectory = join(codexHome, "titlize");
+function installPaths(
+  codexHome: string,
+  binDirectory: string,
+): UserInstallResult & { legacyDirectory: string } {
   return {
-    installDirectory,
-    bundlePath: join(installDirectory, "codex-title"),
+    legacyDirectory: join(codexHome, "titlize"),
+    cliPath: join(binDirectory, "titlize"),
     hooksPath: join(codexHome, "hooks.json"),
   };
 }
 
 export async function installUser(options: UserInstallOptions): Promise<UserInstallResult> {
   validateAbsolutePath(options.codexHome);
-  validateAbsolutePath(options.bunExecutable);
-  validateAbsolutePath(options.bundleSource);
+  validateAbsolutePath(options.binDirectory);
+  validateAbsolutePath(options.cliSource);
 
-  const paths = installPaths(options.codexHome);
+  const paths = installPaths(options.codexHome, options.binDirectory);
   const config = await readHooksConfig(paths.hooksPath);
   const hooks = (config.hooks ?? {}) as JsonObject;
   const existingStopGroups = validateStopGroups(hooks.Stop);
   const withoutPreviousInstall = removeTitlizeHandlers(existingStopGroups).groups;
-  const command = `${shellQuote(options.bunExecutable)} ${shellQuote(paths.bundlePath)} hook`;
+  const command = `${shellQuote(paths.cliPath)} hook`;
 
   const nextConfig: JsonObject = {
     ...config,
@@ -191,11 +199,13 @@ export async function installUser(options: UserInstallOptions): Promise<UserInst
   };
 
   try {
-    await mkdir(paths.installDirectory, { recursive: true });
-    await atomicCopy(options.bundleSource, paths.bundlePath);
+    await mkdir(options.codexHome, { recursive: true });
+    await mkdir(options.binDirectory, { recursive: true });
+    await atomicCopy(options.cliSource, paths.cliPath);
     const mode = await fileMode(paths.hooksPath, 0o600);
     await atomicWrite(paths.hooksPath, `${JSON.stringify(nextConfig, null, 2)}\n`, mode);
-    return { bundlePath: paths.bundlePath, hooksPath: paths.hooksPath };
+    await rm(paths.legacyDirectory, { recursive: true, force: true });
+    return { cliPath: paths.cliPath, hooksPath: paths.hooksPath };
   } catch (error) {
     if (error instanceof UserInstallerError) throw error;
     throw new UserInstallerError("user_install_failed");
@@ -204,7 +214,8 @@ export async function installUser(options: UserInstallOptions): Promise<UserInst
 
 export async function uninstallUser(options: UserUninstallOptions): Promise<UserInstallResult> {
   validateAbsolutePath(options.codexHome);
-  const paths = installPaths(options.codexHome);
+  validateAbsolutePath(options.binDirectory);
+  const paths = installPaths(options.codexHome, options.binDirectory);
   const config = await readHooksConfig(paths.hooksPath);
   const hooks = (config.hooks ?? {}) as JsonObject;
   const stopGroups = validateStopGroups(hooks.Stop);
@@ -229,10 +240,11 @@ export async function uninstallUser(options: UserUninstallOptions): Promise<User
   }
 
   try {
-    await rm(paths.installDirectory, { recursive: true, force: true });
+    await rm(paths.cliPath, { force: true });
+    await rm(paths.legacyDirectory, { recursive: true, force: true });
   } catch {
     throw new UserInstallerError("user_uninstall_failed");
   }
 
-  return { bundlePath: paths.bundlePath, hooksPath: paths.hooksPath };
+  return { cliPath: paths.cliPath, hooksPath: paths.hooksPath };
 }

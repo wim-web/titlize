@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -23,10 +23,11 @@ async function fixture() {
   temporaryDirectories.push(root);
 
   const codexHome = join(root, "codex home");
-  const bundleSource = join(root, "bundle.js");
-  await writeFile(bundleSource, "console.log('bundle');\n");
+  const cliSource = join(root, "compiled-titlize");
+  const binDirectory = join(root, "bin dir");
+  await writeFile(cliSource, "compiled-cli\n");
 
-  return { root, codexHome, bundleSource };
+  return { root, codexHome, cliSource, binDirectory };
 }
 
 function titlizeHandlers(config: Record<string, any>): Array<Record<string, any>> {
@@ -45,8 +46,8 @@ describe("user installer", () => {
     );
   });
 
-  test("既存Hookを保持して全プロジェクト向けStop Hookとbundleを追加する", async () => {
-    const { codexHome, bundleSource } = await fixture();
+  test("既存Hookを保持して全プロジェクト向けStop Hookと単体CLIを追加する", async () => {
+    const { codexHome, cliSource, binDirectory } = await fixture();
     await mkdir(codexHome, { recursive: true });
     const existing = {
       description: "existing user hooks",
@@ -80,12 +81,13 @@ describe("user installer", () => {
 
     const result = await installUser({
       codexHome,
-      bunExecutable: "/opt/bun's/bin/bun",
-      bundleSource,
+      binDirectory,
+      cliSource,
     });
 
-    expect(result.bundlePath).toBe(join(codexHome, "titlize", "codex-title"));
-    expect(await readFile(result.bundlePath, "utf8")).toBe("console.log('bundle');\n");
+    expect(result.cliPath).toBe(join(binDirectory, "titlize"));
+    expect(await readFile(result.cliPath, "utf8")).toBe("compiled-cli\n");
+    expect((await stat(result.cliPath)).mode & 0o777).toBe(0o755);
 
     const installed = JSON.parse(await readFile(result.hooksPath, "utf8"));
     expect(installed.description).toBe("existing user hooks");
@@ -99,32 +101,28 @@ describe("user installer", () => {
       timeout: 150,
       statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
     });
-    expect(handlers[0]?.command).toBe(
-      `'/opt/bun'"'"'s/bin/bun' '${join(codexHome, "titlize", "codex-title")}' hook`,
-    );
+    expect(handlers[0]?.command).toBe(`'${join(binDirectory, "titlize")}' hook`);
   });
 
   test("再インストールしてもtitlize Hookを重複させない", async () => {
-    const { codexHome, bundleSource } = await fixture();
+    const { codexHome, cliSource, binDirectory } = await fixture();
     const options = {
       codexHome,
-      bunExecutable: "/opt/homebrew/bin/bun",
-      bundleSource,
+      binDirectory,
+      cliSource,
     };
 
     await installUser(options);
-    await writeFile(bundleSource, "console.log('updated');\n");
+    await writeFile(cliSource, "updated-cli\n");
     await installUser(options);
 
     const installed = JSON.parse(await readFile(join(codexHome, "hooks.json"), "utf8"));
     expect(titlizeHandlers(installed)).toHaveLength(1);
-    expect(await readFile(join(codexHome, "titlize", "codex-title"), "utf8")).toBe(
-      "console.log('updated');\n",
-    );
+    expect(await readFile(join(binDirectory, "titlize"), "utf8")).toBe("updated-cli\n");
   });
 
   test("不正な既存hooks.jsonを上書きしない", async () => {
-    const { codexHome, bundleSource } = await fixture();
+    const { codexHome, cliSource, binDirectory } = await fixture();
     await mkdir(codexHome, { recursive: true });
     const hooksPath = join(codexHome, "hooks.json");
     await writeFile(hooksPath, "not-json\n");
@@ -132,8 +130,8 @@ describe("user installer", () => {
     try {
       await installUser({
         codexHome,
-        bunExecutable: "/opt/homebrew/bin/bun",
-        bundleSource,
+        binDirectory,
+        cliSource,
       });
       throw new Error("expected installUser to reject");
     } catch (error) {
@@ -142,15 +140,27 @@ describe("user installer", () => {
     }
 
     expect(await readFile(hooksPath, "utf8")).toBe("not-json\n");
-    expect(await Bun.file(join(codexHome, "titlize", "codex-title")).exists()).toBe(false);
+    expect(await Bun.file(join(binDirectory, "titlize")).exists()).toBe(false);
+  });
+
+  test("旧Bun bundle配置をインストール成功後に削除する", async () => {
+    const { codexHome, cliSource, binDirectory } = await fixture();
+    const legacyDirectory = join(codexHome, "titlize");
+    await mkdir(legacyDirectory, { recursive: true });
+    await writeFile(join(legacyDirectory, "codex-title"), "legacy-bundle\n");
+
+    await installUser({ codexHome, binDirectory, cliSource });
+
+    expect(await Bun.file(legacyDirectory).exists()).toBe(false);
+    expect(await Bun.file(join(binDirectory, "titlize")).exists()).toBe(true);
   });
 
   test("アンインストールはtitlizeだけを削除して既存Hookを残す", async () => {
-    const { codexHome, bundleSource } = await fixture();
+    const { codexHome, cliSource, binDirectory } = await fixture();
     await installUser({
       codexHome,
-      bunExecutable: "/opt/homebrew/bin/bun",
-      bundleSource,
+      binDirectory,
+      cliSource,
     });
 
     const hooksPath = join(codexHome, "hooks.json");
@@ -160,11 +170,11 @@ describe("user installer", () => {
     ];
     await writeFile(hooksPath, `${JSON.stringify(installed, null, 2)}\n`);
 
-    await uninstallUser({ codexHome });
+    await uninstallUser({ codexHome, binDirectory });
 
     const uninstalled = JSON.parse(await readFile(hooksPath, "utf8"));
     expect(titlizeHandlers(uninstalled)).toHaveLength(0);
     expect(uninstalled.hooks.SessionStart).toHaveLength(1);
-    expect(await Bun.file(join(codexHome, "titlize", "codex-title")).exists()).toBe(false);
+    expect(await Bun.file(join(binDirectory, "titlize")).exists()).toBe(false);
   });
 });

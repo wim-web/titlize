@@ -28,18 +28,18 @@ bun run typecheck
 bun run install:user
 ```
 
-`install:user`は通常bundleを作り、次の場所へインストールします。
+`install:user`はBunランタイム込みの単体CLIをビルドし、次の場所へインストールします。
 
 ```text
-${CODEX_HOME:-~/.codex}/titlize/codex-title
+${TITLIZE_INSTALL_DIR:-~/.local/bin}/titlize
 ${CODEX_HOME:-~/.codex}/hooks.json
 ```
 
-既存のユーザーHookは保持し、titlizeの`Stop` Hookだけを追加または更新します。Hookはインストール時に検出したBunの絶対パスと、インストール済みbundleの絶対パスを使うため、起動中のプロジェクトやGit rootには依存しません。
+既存のユーザーHookは保持し、titlizeの`Stop` Hookだけを追加または更新します。Hookはインストール済みCLIの絶対パスを直接実行するため、BunのPATH、起動中のプロジェクト、Git rootには依存しません。`~/.local/bin`がPATHに含まれていれば、端末からも`titlize`コマンドとして実行できます。
 
 インストール後にCodexで`/hooks`を実行し、内容を確認して`titlize: タスク名を更新しています`というHookを信頼してください。一度だけ試す場合はCodex起動時の`--dangerously-bypass-hook-trust`も利用できます。ユーザー共通Hookなので、その後はどのプロジェクトをCodexで開いても動作します。
 
-コード更新後は`bun run install:user`を再実行するとbundleとHookを更新します。削除するときは次を実行します。既存の他のユーザーHookは削除しません。
+コード更新後は`bun run install:user`を再実行するとCLIとHookを更新します。旧方式の`${CODEX_HOME:-~/.codex}/titlize/codex-title`は、正常なインストール完了後に削除します。削除するときは次を実行します。既存の他のユーザーHookは削除しません。
 
 ```bash
 bun run uninstall:user
@@ -48,6 +48,13 @@ bun run uninstall:user
 同梱インストーラーの対応環境はmacOS/Linuxです。WindowsではHook commandとインストールパスを対象環境に合わせる必要があります。
 
 ## CLI
+
+インストール後は通常のCLIとして実行できます。
+
+```bash
+titlize update --session-id <session-id> --force
+titlize update --session-id <session-id> --transcript-path /absolute/path/to/rollout.jsonl --force
+```
 
 開発中はTypeScriptを直接実行します。
 
@@ -59,19 +66,14 @@ bun src/cli.ts update --session-id <session-id> --transcript-path /absolute/path
 
 `update --force`はStop回数を増やさず、手動変更による自動更新停止を意図的に上書きして解除します。`--transcript-path`を省略すると、App Serverの`thread/read(includeTurns: true)`から会話を取得します。相対パス、空のsession ID、未知・重複・不足したflagは拒否します。
 
-通常のbundleは次で作成し、Bunから実行できます。
+単体CLIは次で作成し、そのまま実行できます。
 
 ```bash
 bun run build
-bun dist/codex-title update --session-id <session-id> --force
+./dist/titlize update --session-id <session-id> --force
 ```
 
-Bunランタイム込みの単一実行ファイルが必要な場合は、将来の配布形態と同じく`--compile`を使います。`install:user`はBunで実行する通常bundleを使うため、この手順は必須ではありません。macOSではcompile時または配布時のcode signingが実行環境固有の工程になることがあり、このリポジトリは署名identityや配布用署名を設定しません。Bun 1.3.12のcompileがローカルの署名環境で失敗する場合は、通常bundleを使うか、配布環境側で署名工程を構成してください。
-
-```bash
-bun build --compile --outfile=dist/codex-title-bin src/cli.ts
-./dist/codex-title-bin update --session-id <session-id> --force
-```
+`bun run build`は`bun build --compile`を使います。macOSでは、Bun 1.3.12が埋込み後に残す無効な署名情報を除去し、ローカルad-hoc署名を付け直して`codesign --verify --strict`まで実行します。生成物はBunを別途起動しないMach-O実行ファイルです。LinuxではBunの単体実行ファイルをそのまま生成します。
 
 ## 設定
 
@@ -148,7 +150,7 @@ stderrには`hook_input_invalid`、`title_update_failed`のような固定分類
 
 ## テストと受け入れ確認
 
-自動テスト、型検査、bundle作成を実行します。
+自動テスト、型検査、単体CLI作成を実行します。
 
 ```bash
 bun test
