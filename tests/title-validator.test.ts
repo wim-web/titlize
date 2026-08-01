@@ -72,6 +72,14 @@ describe("validateTitle", () => {
     expect(validateTitle("**「https://example.test/a」**", 60)).toBe("https://example.test/a");
   });
 
+  test("入れ子の強調で囲まれたURLから強調だけを除去する", () => {
+    expect(validateTitle("**_https://example.test/a_**", 60)).toBe("https://example.test/a");
+    expect(validateTitle("_**https://example.test/a**_", 60)).toBe("https://example.test/a");
+    expect(validateTitle("**~~https://example.test/a~~**", 60)).toBe("https://example.test/a");
+    expect(validateTitle("(**https://example.test/a**)", 60)).toBe("(https://example.test/a)");
+    expect(validateTitle("[**https://example.test/a**]", 60)).toBe("[https://example.test/a]");
+  });
+
   test("孤立backtickを保持し、空の対応backtickだけを拒否する", () => {
     expect(validateTitle("`", 1)).toBe("`");
     expect(() => validateTitle("``", 1)).toThrow(TitleValidationError);

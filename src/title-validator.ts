@@ -163,17 +163,28 @@ function findClosingParenthesis(value: string, start: number): number {
 
 function protectUrls(value: string, placeholders: string[]): string {
   return value.replace(/https?:\/\/[^\s"'“”‘’「」『』【】`]+/g, (url, offset: number, input: string) => {
-    const opening = urlWrapperMarkers.find((marker) => input.slice(offset - marker.length, offset) === marker);
-    if (opening) {
-      const punctuation = url.match(/[.,;:!?。、]+$/)?.[0] ?? "";
-      const core = punctuation ? url.slice(0, -punctuation.length) : url;
-      const closing = urlWrapperMarkers.find((marker) => core.endsWith(marker));
-      if (closing === opening) {
-        return `${placeholder(placeholders, core.slice(0, -closing.length))}${closing}${punctuation}`;
+    const expectedClosing = readOpeningMarkers(input, offset);
+    if (expectedClosing) {
+      const suffix = url.match(/[.,;:!?。、\)\]\}]+$/)?.[0] ?? "";
+      const core = suffix ? url.slice(0, -suffix.length) : url;
+      if (core.endsWith(expectedClosing)) {
+        return `${placeholder(placeholders, core.slice(0, -expectedClosing.length))}${expectedClosing}${suffix}`;
       }
     }
     return placeholder(placeholders, url);
   });
+}
+
+function readOpeningMarkers(value: string, offset: number): string {
+  let cursor = offset;
+  let expectedClosing = "";
+  while (cursor > 0) {
+    const marker = urlWrapperMarkers.find((candidate) => value.slice(cursor - candidate.length, cursor) === candidate);
+    if (!marker) break;
+    expectedClosing += marker;
+    cursor -= marker.length;
+  }
+  return expectedClosing;
 }
 
 function stripEmphasis(value: string): string {
