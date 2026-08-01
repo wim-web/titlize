@@ -23,6 +23,8 @@ export type TitleUpdateResult = {
 export interface TitleUpdateStateStore {
   getSession(sessionId: string): SessionState | undefined;
   markPending(sessionId: string, now: string): SessionState;
+  markTitleWritePending(sessionId: string, title: string, now: string): SessionState;
+  clearTitleWritePending(sessionId: string, now: string): SessionState;
   markSuccess(sessionId: string, title: string, now: string): SessionState;
   markForcedSuccess(sessionId: string, title: string, now: string): SessionState;
   markAutoUpdateDisabled(sessionId: string, now: string): SessionState;
@@ -101,28 +103,59 @@ export class TitleUpdateService {
     const request = parseUpdateRequest(input);
     const state = this.readState(request.sessionId);
 
-    if (!request.force && state?.autoUpdateDisabled === true) {
+    if (
+      !request.force &&
+      state?.autoUpdateDisabled === true &&
+      state.pendingTitle === null
+    ) {
       return { status: "disabled" };
     }
 
     this.writeState("markPending", request.sessionId);
     const currentTitle = await this.readCurrentTitle(request.sessionId);
 
-    if (
-      !request.force &&
-      state !== undefined &&
-      state.lastAutoTitle !== null &&
-      currentTitle !== state.lastAutoTitle
-    ) {
-      this.writeState("markAutoUpdateDisabled", request.sessionId);
-      return { status: "manual-change" };
+    if (!request.force && state !== undefined) {
+      if (state.pendingTitle !== null) {
+        if (currentTitle === state.pendingTitle) {
+          this.writeState(
+            state.autoUpdateDisabled ? "markForcedSuccess" : "markSuccess",
+            request.sessionId,
+            state.pendingTitle,
+          );
+          return { status: "unchanged" };
+        }
+        if (state.autoUpdateDisabled) {
+          this.writeState("markAutoUpdateDisabled", request.sessionId);
+          return { status: "disabled" };
+        }
+        if (state.lastAutoTitle !== null && currentTitle !== state.lastAutoTitle) {
+          this.writeState("markAutoUpdateDisabled", request.sessionId);
+          return { status: "manual-change" };
+        }
+        this.writeState("clearTitleWritePending", request.sessionId);
+      } else if (
+        state.lastAutoTitle !== null &&
+        currentTitle !== state.lastAutoTitle
+      ) {
+        this.writeState("markAutoUpdateDisabled", request.sessionId);
+        return { status: "manual-change" };
+      }
     }
 
     const messages = await this.readMessages(request);
     const rawTitle = await this.generateTitle(messages, currentTitle);
     const title = this.validateGeneratedTitle(rawTitle);
 
+    if (!request.force) {
+      const confirmedTitle = await this.readCurrentTitle(request.sessionId);
+      if (confirmedTitle !== currentTitle) {
+        this.writeState("markAutoUpdateDisabled", request.sessionId);
+        return { status: "manual-change" };
+      }
+    }
+
     if (title !== currentTitle) {
+      this.writeState("markTitleWritePending", request.sessionId, title);
       await this.writeTitle(request.sessionId, title);
     }
 
@@ -137,7 +170,8 @@ export class TitleUpdateService {
 
   private readState(sessionId: string): SessionState | undefined {
     try {
-      return this.store.getSession(sessionId);
+      const state = this.store.getSession(sessionId);
+      return state === undefined ? undefined : snapshotSessionState(state, sessionId);
     } catch {
       throw TitleUpdateError.for("state_failed");
     }
@@ -146,6 +180,8 @@ export class TitleUpdateService {
   private writeState(
     operation:
       | "markPending"
+      | "markTitleWritePending"
+      | "clearTitleWritePending"
       | "markSuccess"
       | "markForcedSuccess"
       | "markAutoUpdateDisabled",
@@ -156,6 +192,10 @@ export class TitleUpdateService {
       const now = this.clock();
       if (operation === "markPending") {
         this.store.markPending(sessionId, now);
+      } else if (operation === "markTitleWritePending") {
+        this.store.markTitleWritePending(sessionId, requireTitle(title), now);
+      } else if (operation === "clearTitleWritePending") {
+        this.store.clearTitleWritePending(sessionId, now);
       } else if (operation === "markAutoUpdateDisabled") {
         this.store.markAutoUpdateDisabled(sessionId, now);
       } else if (operation === "markForcedSuccess") {
@@ -171,7 +211,9 @@ export class TitleUpdateService {
 
   private async readCurrentTitle(sessionId: string): Promise<string | undefined> {
     try {
-      return await this.sink.readTitle(sessionId);
+      const title = await this.sink.readTitle(sessionId);
+      if (title !== undefined && typeof title !== "string") throw new Error();
+      return title;
     } catch {
       throw TitleUpdateError.for("title_read_failed");
     }
@@ -283,4 +325,61 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 function requireTitle(title: string | undefined): string {
   if (title === undefined) throw TitleUpdateError.for("state_failed");
   return title;
+}
+
+function snapshotSessionState(value: unknown, expectedSessionId: string): SessionState {
+  if (!isPlainRecord(value)) throw new Error();
+  const requiredFields = [
+    "sessionId",
+    "stopCount",
+    "lastTurnId",
+    "pendingUpdate",
+    "lastAutoTitle",
+    "pendingTitle",
+    "autoUpdateDisabled",
+    "lastSuccessAt",
+    "updatedAt",
+  ] as const;
+  if (requiredFields.some((field) => !Object.hasOwn(value, field))) throw new Error();
+
+  const sessionId = value.sessionId;
+  const stopCount = value.stopCount;
+  const lastTurnId = value.lastTurnId;
+  const pendingUpdate = value.pendingUpdate;
+  const lastAutoTitle = value.lastAutoTitle;
+  const pendingTitle = value.pendingTitle;
+  const autoUpdateDisabled = value.autoUpdateDisabled;
+  const lastSuccessAt = value.lastSuccessAt;
+  const updatedAt = value.updatedAt;
+
+  if (
+    sessionId !== expectedSessionId ||
+    !Number.isSafeInteger(stopCount) ||
+    (stopCount as number) < 0 ||
+    !isNullableString(lastTurnId) ||
+    typeof pendingUpdate !== "boolean" ||
+    !isNullableString(lastAutoTitle) ||
+    !isNullableString(pendingTitle) ||
+    typeof autoUpdateDisabled !== "boolean" ||
+    !isNullableString(lastSuccessAt) ||
+    typeof updatedAt !== "string"
+  ) {
+    throw new Error();
+  }
+
+  return {
+    sessionId,
+    stopCount: stopCount as number,
+    lastTurnId,
+    pendingUpdate,
+    lastAutoTitle,
+    pendingTitle,
+    autoUpdateDisabled,
+    lastSuccessAt,
+    updatedAt,
+  };
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
 }

@@ -76,7 +76,8 @@ export class HookController {
     let record: { isNewTurn: boolean; state: SessionState };
     try {
       record = this.store.recordStop(parsed.sessionId, parsed.turnId, this.clock());
-      if (!record.isNewTurn || record.state.autoUpdateDisabled) return;
+      if (!record.isNewTurn) return;
+      if (record.state.autoUpdateDisabled && record.state.pendingTitle === null) return;
       if (!shouldUpdate(record.state, this.every)) return;
     } catch {
       this.safeLog("state_store_failed");

@@ -20,6 +20,7 @@ export interface SessionState {
   lastTurnId: string | null;
   pendingUpdate: boolean;
   lastAutoTitle: string | null;
+  pendingTitle: string | null;
   autoUpdateDisabled: boolean;
   lastSuccessAt: string | null;
   updatedAt: string;
