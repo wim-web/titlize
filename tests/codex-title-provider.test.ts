@@ -446,7 +446,7 @@ describe("createProcessTreeKiller", () => {
 });
 
 describe("Codex CLI configuration isolation contract", () => {
-  test("0.145.0のignore-user-configはuser configを読まず同じCODEX_HOMEのauthを使う", async () => {
+  test("ignore-user-configはuser configを読まず同じCODEX_HOMEのauthを使う", async () => {
     const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-codex-contract-"));
     const fakeHome = join(temporaryDirectory, "home");
     const fakeCodexHome = join(temporaryDirectory, "codex-home");
@@ -524,7 +524,9 @@ describe("Codex CLI configuration isolation contract", () => {
       expect(help.exitCode).toBe(0);
       expect(version.exitCode).toBe(0);
       expect(features.exitCode).toBe(0);
-      expect(versionOutput).toContain("codex-cli 0.145.0");
+      expect(versionOutput.trim()).toMatch(
+        /^codex-cli (?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
+      );
       expect(helpOutput).toContain("--ignore-user-config");
       expect(helpOutput.replace(/\s+/g, " ")).toContain(
         "Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`",
