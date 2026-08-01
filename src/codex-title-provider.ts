@@ -209,16 +209,23 @@ class ActiveProcessTreeRegistry {
   private handleSignal(signal: LifecycleSignal): void {
     if (this.handlingSignal) return;
     this.handlingSignal = true;
-    this.detachListeners();
     this.killAll();
+    this.detachListeners();
 
-    // Restore default termination semantics after all registered trees are synchronously killed.
-    process.removeAllListeners(signal);
-    try {
-      process.kill(process.pid, signal);
-    } catch {
-      process.exit({ SIGINT: 130, SIGTERM: 143, SIGHUP: 129 }[signal]);
+    if (process.listenerCount(signal) === 0) {
+      // With no host handler, restore the signal's default termination after synchronous cleanup.
+      try {
+        process.kill(process.pid, signal);
+      } catch {
+        process.exit({ SIGINT: 130, SIGTERM: 143, SIGHUP: 129 }[signal]);
+      }
+      return;
     }
+
+    // Host handlers own termination semantics. Do not re-emit and invoke them a second time.
+    queueMicrotask(() => {
+      this.handlingSignal = false;
+    });
   }
 }
 

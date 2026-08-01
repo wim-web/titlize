@@ -203,6 +203,52 @@ describe("CodexTitleProvider", () => {
     }
   });
 
+  test("ホスト独自SIGTERM handlerを保持し二重実行せず子孫だけを回収する", async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "titlize-provider-host-signal-"));
+    const pidFile = join(temporaryDirectory, "tree.json");
+    const markerFile = join(temporaryDirectory, "handlers.log");
+    const workerPath = join(import.meta.dir, "helpers", "title-provider-lifecycle-worker.ts");
+    const wrapper = Bun.spawn(
+      [process.execPath, workerPath, "host-signal", pidFile, markerFile],
+      {
+        env: process.env,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      },
+    );
+    let treePids: { childPid: number; grandchildPid: number } | undefined;
+
+    try {
+      treePids = await readTreePids(pidFile, 2_000);
+      process.kill(wrapper.pid, "SIGTERM");
+      expect(await waitForPromise(wrapper.exited, 1_000)).toBe(true);
+      expect((await readFile(markerFile, "utf8")).trim().split("\n")).toEqual([
+        "before",
+        "after",
+        "remaining:2",
+        "completed",
+      ]);
+      const [childExited, grandchildExited] = await Promise.all([
+        waitForProcessExit(treePids.childPid, 500),
+        waitForProcessExit(treePids.grandchildPid, 500),
+      ]);
+      expect(childExited).toBe(true);
+      expect(grandchildExited).toBe(true);
+    } finally {
+      try {
+        wrapper.kill("SIGKILL");
+      } catch {
+        // Already exited.
+      }
+      if (treePids) {
+        killPid(treePids.childPid);
+        killPid(treePids.grandchildPid);
+      }
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+
   test.each([
     ["null input", null],
     ["messages is not an array", { ...input(), messages: "input-secret" }],
