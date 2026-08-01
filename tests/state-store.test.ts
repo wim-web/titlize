@@ -12,6 +12,12 @@ function openStore(path = join(mkdtempSync(join(tmpdir(), "titlize-state-")), "n
   return { store, path };
 }
 
+function closeStore(store: StateStore): void {
+  const index = stores.indexOf(store);
+  if (index !== -1) stores.splice(index, 1);
+  store.close();
+}
+
 afterEach(() => {
   while (stores.length > 0) stores.pop()?.close();
 });
@@ -97,7 +103,16 @@ describe("StateStore", () => {
     }));
   });
 
-  test("markForcedSuccess は未知セッションでも成功保存し、自動更新停止を解除する", () => {
+  test("markForcedSuccess は未知セッションを直接 upsert して成功情報を保存する", () => {
+    const { store } = openStore();
+
+    expect(store.markForcedSuccess("new", "forced", "forced-at")).toEqual({
+      sessionId: "new", stopCount: 0, lastTurnId: null, pendingUpdate: false,
+      lastAutoTitle: "forced", autoUpdateDisabled: false, lastSuccessAt: "forced-at", updatedAt: "forced-at",
+    });
+  });
+
+  test("markForcedSuccess は既存セッションの自動更新停止を解除する", () => {
     const { store } = openStore();
     store.markAutoUpdateDisabled("s1", "disabled");
 
@@ -117,6 +132,14 @@ describe("StateStore", () => {
       stopCount: 1, lastTurnId: "t1", pendingUpdate: false, autoUpdateDisabled: true,
       lastAutoTitle: "title", lastSuccessAt: "success", updatedAt: "disabled",
     }));
+  });
+
+  test("close 後の DB 操作は閉鎖済み接続として失敗する", () => {
+    const { store } = openStore();
+    closeStore(store);
+
+    expect(() => store.getSession("s1")).toThrow();
+    expect(() => store.markPending("s1", "now")).toThrow();
   });
 });
 
