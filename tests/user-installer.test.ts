@@ -49,7 +49,7 @@ describe("user installer", () => {
     );
   });
 
-  test("既存Hookを保持して更新・タイトル確認・書込み保護Hookと単体CLIを追加する", async () => {
+  test("既存Hookを保持してStop/UserPromptSubmitのHookと単体CLIを追加する", async () => {
     const { codexHome, cliSource, binDirectory } = await fixture();
     await mkdir(codexHome, { recursive: true });
     const existing = {
@@ -121,19 +121,49 @@ describe("user installer", () => {
     });
     expect(promptHandlers[0]?.command).toBe(`'${join(binDirectory, "titlize")}' hook`);
 
-    const preToolHandlers = titlizeHandlers(installed, "PreToolUse");
-    expect(preToolHandlers).toHaveLength(1);
-    expect(installed.hooks.PreToolUse.at(-1).matcher).toBe(
-      "^codex_app__set_thread_title$",
-    );
+    expect(installed.hooks.PreToolUse).toBeUndefined();
+    expect(installed.hooks.PostToolUse).toBeUndefined();
+  });
 
-    const postToolHandlers = titlizeHandlers(installed, "PostToolUse");
-    expect(postToolHandlers).toHaveLength(2);
-    expect(installed.hooks.PostToolUse.slice(-2).map((group: Record<string, any>) => group.matcher))
-      .toEqual([
-        "^codex_app__read_thread$",
-        "^codex_app__set_thread_title$",
-      ]);
+  test("旧リリースのPreToolUse/PostToolUseエントリを撤去し、ユーザー自前のものは残す", async () => {
+    const { codexHome, cliSource, binDirectory } = await fixture();
+    await mkdir(codexHome, { recursive: true });
+    const titlizeHandler = {
+      type: "command",
+      command: "'/old/titlize' hook",
+      timeout: 30,
+      statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
+    };
+    const userHandler = {
+      type: "command",
+      command: "bash /existing/pre-tool.sh",
+      timeout: 5,
+    };
+    const existing = {
+      hooks: {
+        PreToolUse: [
+          { matcher: "^codex_app__set_thread_title$", hooks: [titlizeHandler] },
+          { matcher: "^Bash$", hooks: [userHandler] },
+        ],
+        PostToolUse: [
+          { matcher: "^(?:codex_appread_thread|codex_app__read_thread)$", hooks: [titlizeHandler] },
+          { matcher: "^(?:codex_appset_thread_title|codex_app__set_thread_title)$", hooks: [titlizeHandler] },
+        ],
+      },
+    };
+    await writeFile(join(codexHome, "hooks.json"), `${JSON.stringify(existing, null, 2)}\n`);
+
+    const result = await installUser({ codexHome, binDirectory, cliSource });
+
+    const installed = JSON.parse(await readFile(result.hooksPath, "utf8"));
+    expect(titlizeHandlers(installed, "PreToolUse")).toHaveLength(0);
+    expect(titlizeHandlers(installed, "PostToolUse")).toHaveLength(0);
+    expect(installed.hooks.PreToolUse).toEqual([
+      { matcher: "^Bash$", hooks: [userHandler] },
+    ]);
+    expect(installed.hooks.PostToolUse).toBeUndefined();
+    expect(titlizeHandlers(installed, "Stop")).toHaveLength(1);
+    expect(titlizeHandlers(installed, "UserPromptSubmit")).toHaveLength(1);
   });
 
   test("再インストールしてもtitlize Hookを重複させない", async () => {
@@ -154,8 +184,8 @@ describe("user installer", () => {
     const installed = JSON.parse(await readFile(join(codexHome, "hooks.json"), "utf8"));
     expect(titlizeHandlers(installed, "Stop")).toHaveLength(1);
     expect(titlizeHandlers(installed, "UserPromptSubmit")).toHaveLength(1);
-    expect(titlizeHandlers(installed, "PreToolUse")).toHaveLength(1);
-    expect(titlizeHandlers(installed, "PostToolUse")).toHaveLength(2);
+    expect(installed.hooks.PreToolUse).toBeUndefined();
+    expect(installed.hooks.PostToolUse).toBeUndefined();
     expect(await readFile(join(binDirectory, "titlize"), "utf8")).toBe("updated-cli\n");
     expect(await readFile(configPath, "utf8")).toBe(customConfig);
   });

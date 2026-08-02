@@ -10,12 +10,13 @@ export const DEFAULT_TITLE_CONFIG_FILE = {
   maxChars: 40,
 } as const;
 
-const CONFIG_KEYS = new Set(["every", "maxChars", "statePath"]);
+const CONFIG_KEYS = new Set(["every", "maxChars", "statePath", "appStatePath"]);
 
 interface TitleConfigFile {
   every?: number;
   maxChars?: number;
   statePath?: string;
+  appStatePath?: string;
 }
 
 export interface LoadConfigOptions {
@@ -98,6 +99,7 @@ function parseConfigFile(contents: string | undefined): TitleConfigFile {
     every: optionalPositiveInteger(parsed.every, "every"),
     maxChars: optionalPositiveInteger(parsed.maxChars, "maxChars"),
     statePath: optionalNonBlank(parsed.statePath, "statePath"),
+    appStatePath: optionalNonBlank(parsed.appStatePath, "appStatePath"),
   };
 }
 
@@ -121,14 +123,20 @@ export function loadConfig(
   const fileConfig = parseConfigFile(
     (options.readFile ?? readOptionalFile)(configPath),
   );
+  const codexHome = nonBlank(
+    env.CODEX_HOME,
+    "CODEX_HOME",
+    join(homedir(), ".codex"),
+  );
   const statePath = nonBlank(
     env.CODEX_TITLE_STATE_PATH,
     "CODEX_TITLE_STATE_PATH",
-    fileConfig.statePath ??
-      (env.CODEX_HOME
-        ? join(env.CODEX_HOME, "codex-title", "state.sqlite3")
-        : join(homedir(), ".codex", "codex-title", "state.sqlite3")),
+    fileConfig.statePath ?? join(codexHome, "codex-title", "state.sqlite3"),
   );
+  const appStatePath =
+    env.CODEX_TITLE_APP_STATE_PATH !== undefined
+      ? nonBlank(env.CODEX_TITLE_APP_STATE_PATH, "CODEX_TITLE_APP_STATE_PATH", "")
+      : fileConfig.appStatePath;
 
   return {
     every: positiveInteger(
@@ -142,5 +150,7 @@ export function loadConfig(
       fileConfig.maxChars ?? DEFAULT_TITLE_CONFIG_FILE.maxChars,
     ),
     statePath,
+    codexHome,
+    ...(appStatePath === undefined ? {} : { appStatePath }),
   };
 }
