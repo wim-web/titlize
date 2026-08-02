@@ -2,24 +2,17 @@
 
 Codex Appのタスク名を、一定ターンごとに自動更新するユーザー共通Hookです。
 
-タイトルの保存には、Codex App内蔵の`codex_app__set_thread_title`を使います。titlize自身はApp Serverへ接続せず、共有Server、常駐デーモン、LaunchAgent、タイトル生成用の別タスク、追加のモデル呼び出しも起動しません。
+タイトルの保存にはCodex App内蔵の`codex_app__set_thread_title`を使います。共有Server、常駐デーモン、LaunchAgent、タイトル生成用の別タスク、追加のモデル呼び出しは使いません。
 
 ## 動作
 
 ```text
-通常のCodex応答が終了
-  → Stop Hookでsession_idごとの回数を記録（出力は常に {}）
-  → 更新回なら pending_update = 1 を保存
-次のユーザーメッセージ送信時
-  → UserPromptSubmit Hookがpendingを検出
-  → hookSpecificOutput.additionalContext でrename指示をモデルへ注入
-  → モデルが通常回答の処理中にcodex_app__set_thread_titleを1回呼ぶ
-  → タイトルが再起動なしでサイドバーへ反映される
+Stop Hook            : session_idごとに回数を記録し、更新回ならpending_update = 1を保存（表示なし）
+UserPromptSubmit Hook: 次のユーザーメッセージ時、pendingがあればadditionalContextでrename指示を注入
+モデル               : 通常回答の処理中にcodex_app__set_thread_titleを1回呼ぶ → サイドバーへ即反映
 ```
 
-既定では3回目の新しい`Stop`ごとに更新を予約します。同じ`turn_id`の再送と、`stop_hook_active: true`の継続側`Stop`は数えません。
-
-`Stop`側は何も表示せず、モデルの継続も要求しません。rename指示は次のユーザーメッセージの回答ターンへ`additionalContext`として裏で注入されるため、追加の吹き出しや追加のモデル呼び出しは発生しません。そのぶんタイトル反映は、更新回の次にユーザーがメッセージを送った回答時になります。注入指示にはタイトル変更へ言及しないよう含めていますが、ツール実行表示の見え方はCodex App側のUIに依存します。
+既定では3回目の新しい`Stop`ごとに更新を予約します。同じ`turn_id`の再送と、`stop_hook_active: true`の継続側`Stop`は数えません。注入できなかったpendingは以降のメッセージで再試行します。
 
 ## セットアップ
 
@@ -27,84 +20,48 @@ Bun 1.3系が必要です。
 
 ```bash
 bun install
-bun test
-bun run typecheck
 bun run install:user
 ```
 
-`install:user`はBunランタイム込みの単体CLIをビルドし、次へインストールします。
+`${TITLIZE_INSTALL_DIR:-~/.local/bin}/titlize`と`${CODEX_HOME:-~/.codex}/hooks.json`を更新します。既存の他のHookは保持し、titlizeの`Stop`と`UserPromptSubmit`だけを追加・更新します。
 
-```text
-${TITLIZE_INSTALL_DIR:-~/.local/bin}/titlize
-${CODEX_HOME:-~/.codex}/hooks.json
-```
+インストール後、Codexの`/hooks`でtitlizeのHook（2件）を信頼してください。信頼されていないHookは実行されません。
 
-既存のユーザーHookは保持し、titlizeの`Stop`と`UserPromptSubmit` Hookだけを追加または更新します。Hook定義を追加・変更した場合は、CodexのHook画面で`titlize: タスク名を更新しています`（2件）を確認して信頼してください。信頼されていないHookは実行されません。
-
-アンインストールは次のとおりです。既存の他のHookは削除しません。
-
-```bash
-bun run uninstall:user
-```
-
-## CLI
-
-実行コマンドはHook用だけです。
-
-```bash
-titlize hook
-```
-
-旧`titlize update --force`は廃止しました。App Serverへ直接書く旧経路を再び使わないため、引数エラーで終了します。
+アンインストールは`bun run uninstall:user`です（他のHookは残します）。
 
 ## 設定
 
 | 環境変数 | 既定値 | 説明 |
 | --- | --- | --- |
-| `CODEX_TITLE_EVERY` | `3` | セッションごとに何回目の通常`Stop`で更新を予約するか |
-| `CODEX_TITLE_MAX_CHARS` | `40` | 注入指示に含めるタイトル最大文字数 |
+| `CODEX_TITLE_EVERY` | `3` | 何回目の通常`Stop`で更新を予約するか |
+| `CODEX_TITLE_MAX_CHARS` | `40` | タイトルの最大文字数 |
 | `CODEX_TITLE_STATE_PATH` | `${CODEX_HOME:-~/.codex}/codex-title/state.sqlite3` | SQLite状態ファイル |
 
 整数設定は正の10進安全整数だけを受け入れます。
 
-## 状態と再試行
+## 注意点
 
-`session_id`ごとに状態を分離し、`(session_id, turn_id)`を処理済みテーブルへ保存します。更新条件は次のとおりです。
+- **反映は1ターン遅れ**: タイトルが変わるのは、更新回の次にユーザーがメッセージを送った回答時です。メッセージを送らない限り反映されません。
+- **会話コンテキストに指示が残る**: rename指示は`developer`メッセージとして会話履歴に永続化されます（約200文字、既定で3ターンに1回）。吹き出しには表示されませんが無痕跡ではなく、thinking（推論要約）にタイトル更新への言及が出ることがあります。
+- **Codex App専用**: `codex_app__set_thread_title`はCodex App（Desktop / VS Code連携）の内蔵ツールです。動作確認はCodex Desktop 0.146系。ターミナル単体の`codex`にはこのツールが無い可能性があり、その場合タイトルは更新されません。
+- **手動リネームを保護しない**: 手動で付けたタイトルも次の更新周期で上書きされます（旧方式にあった手動変更検出は廃止）。
+- **モデル依存**: モデルが注入指示を無視した場合、その周期の更新はスキップされ、次の周期で再試行します。
+- 旧バージョンでpendingが残ったセッションは、開いてメッセージを送ると1回だけリネームされます（回復動作）。
 
-```text
-stop_count % CODEX_TITLE_EVERY == 0
-または
-pending_update == true
-```
-
-更新回の`Stop`で`pending_update = 1`を保存し、次の`UserPromptSubmit`でrename指示を注入できた時点で`pending_update = 0`へ戻します。注入の記録に失敗した場合は注入せずpendingを残し、以降のユーザーメッセージで再試行します。
-
-既存DBとの互換性のため旧タイトル管理列も保持していますが、新しい自動更新経路はApp Serverのタイトル読取り・書込みには使いません。
-
-## テストと確認
+## 開発
 
 ```bash
 bun test
 bun run typecheck
-bun run build
+bun run build   # dist/titlize を生成
 ```
 
-Hook出力だけを一時DBで確認できます。
+Hook入出力の単体確認:
 
 ```bash
 state_dir="$(mktemp -d)"
-printf '%s\n' '{"hook_event_name":"Stop","session_id":"test-session","turn_id":"test-turn","transcript_path":null,"stop_hook_active":false}' \
-  | CODEX_TITLE_EVERY=1 CODEX_TITLE_STATE_PATH="$state_dir/state.sqlite3" bun src/cli.ts hook
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"test-session","prompt":"next"}' \
-  | CODEX_TITLE_EVERY=1 CODEX_TITLE_STATE_PATH="$state_dir/state.sqlite3" bun src/cli.ts hook
+printf '%s\n' '{"hook_event_name":"Stop","session_id":"s","turn_id":"t","transcript_path":null,"stop_hook_active":false}' \
+  | CODEX_TITLE_EVERY=1 CODEX_TITLE_STATE_PATH="$state_dir/state.sqlite3" bun src/cli.ts hook   # => {}
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"s","prompt":"next"}' \
+  | CODEX_TITLE_EVERY=1 CODEX_TITLE_STATE_PATH="$state_dir/state.sqlite3" bun src/cli.ts hook   # => hookSpecificOutput入りJSON
 ```
-
-1回目の`Stop`出力は`{}`のまま、2回目の`UserPromptSubmit`出力に`hookSpecificOutput`と`codex_app__set_thread_title`が含まれれば、注入の生成は成功です。
-
-実Appでは、新しいタスクで3回やり取りして4回目のメッセージを送り、その回答の処理中にサイドバーのタイトルが再起動なしで変わることと、余計な吹き出しが出ないことを確認します。共有Serverが存在しない確認は次です。
-
-```bash
-lsof -n -P -U | grep app-server-control.sock
-```
-
-何も出なければ共有Serverは動いていません。
