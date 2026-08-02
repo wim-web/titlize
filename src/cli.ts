@@ -159,6 +159,8 @@ type CliLogCode =
 const CLI_LOG_LINES: Record<CliLogCode, string> = {
   invalid_stop_input: "codex-title: invalid_stop_input\n",
   invalid_prompt_input: "codex-title: invalid_prompt_input\n",
+  invalid_tool_input: "codex-title: invalid_tool_input\n",
+  title_read_failed: "codex-title: title_read_failed\n",
   state_store_failed: "codex-title: state_store_failed\n",
   invalid_arguments: "codex-title: invalid_arguments\n",
   hook_input_invalid: "codex-title: hook_input_invalid\n",

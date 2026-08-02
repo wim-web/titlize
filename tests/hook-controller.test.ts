@@ -44,13 +44,64 @@ function promptSubmit(
   return {
     hook_event_name: "UserPromptSubmit",
     session_id: sessionId,
+    turn_id: "prompt-turn",
     prompt: "次の依頼",
     ...extra,
   };
 }
 
+function preSetTitle(
+  sessionId: string,
+  turnId: string,
+  title: string,
+  threadId = sessionId,
+): Record<string, unknown> {
+  return {
+    hook_event_name: "PreToolUse",
+    session_id: sessionId,
+    turn_id: turnId,
+    tool_name: "codex_app__set_thread_title",
+    tool_input: { threadId, title },
+  };
+}
+
+function postReadTitle(
+  sessionId: string,
+  turnId: string,
+  title: string | null,
+  threadId = sessionId,
+): Record<string, unknown> {
+  return {
+    hook_event_name: "PostToolUse",
+    session_id: sessionId,
+    turn_id: turnId,
+    tool_name: "codex_app__read_thread",
+    tool_input: { threadId },
+    tool_response: { thread: { id: threadId, title } },
+  };
+}
+
+function postSetTitle(
+  sessionId: string,
+  turnId: string,
+  title: string,
+  threadId = sessionId,
+): Record<string, unknown> {
+  return {
+    hook_event_name: "PostToolUse",
+    session_id: sessionId,
+    turn_id: turnId,
+    tool_name: "codex_app__set_thread_title",
+    tool_input: { threadId, title },
+    tool_response: { threadId, title },
+  };
+}
+
 function additionalContextOf(output: HookOutput): string {
-  return "hookSpecificOutput" in output ? output.hookSpecificOutput.additionalContext : "";
+  if (!("hookSpecificOutput" in output)) return "";
+  return "additionalContext" in output.hookSpecificOutput
+    ? output.hookSpecificOutput.additionalContext
+    : "";
 }
 
 function harness(options: {
@@ -74,16 +125,13 @@ function harness(options: {
 
 function throwingStore(operation: keyof HookStateStore): HookStateStore {
   const base = openStore();
-  return {
-    getSession: (sessionId) => base.getSession(sessionId),
-    recordStop: (sessionId, turnId, now) => base.recordStop(sessionId, turnId, now),
-    markPending: (sessionId, now) => base.markPending(sessionId, now),
-    markRenameContinuationFinished: (sessionId, now) =>
-      base.markRenameContinuationFinished(sessionId, now),
-    [operation](): never {
-      throw new Error("database-secret");
+  return new Proxy(base as unknown as HookStateStore, {
+    get(target, property, receiver) {
+      if (property === operation) return () => { throw new Error("database-secret"); };
+      const value: unknown = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(base) : value;
     },
-  } as HookStateStore;
+  });
 }
 
 describe("HookController", () => {
@@ -133,13 +181,18 @@ describe("HookController", () => {
 
   test.each([
     ["session欠落", { hook_event_name: "UserPromptSubmit", prompt: "p" }],
+    ["turn欠落", { hook_event_name: "UserPromptSubmit", session_id: "s1", prompt: "p" }],
     ["session型", promptSubmit("ignored", { session_id: 1 })],
+    ["turn型", promptSubmit("ignored", { turn_id: 1 })],
     ["null session", promptSubmit("ignored", { session_id: null })],
     ["空session", promptSubmit("ignored", { session_id: "" })],
+    ["空turn", promptSubmit("ignored", { turn_id: "" })],
     ["NUL session", promptSubmit("ignored", { session_id: "s\0secret" })],
+    ["NUL turn", promptSubmit("ignored", { turn_id: "t\0secret" })],
     ["長いsession", promptSubmit("ignored", { session_id: "s".repeat(4097) })],
+    ["長いturn", promptSubmit("ignored", { turn_id: "t".repeat(4097) })],
   ])("不正なUserPromptSubmit（%s）は注入せず固定codeだけをログする", async (_name, input) => {
-    const h = harness({ store: throwingStore("getSession") });
+    const h = harness({ store: throwingStore("beginRenameAttempt") });
 
     await expect(h.controller.handle(input)).resolves.toEqual({});
     expect(h.logs).toEqual(["invalid_prompt_input"]);
@@ -157,7 +210,7 @@ describe("HookController", () => {
     );
   });
 
-  test("pendingがあれば次のUserPromptSubmitでrename指示を注入しpendingを完了する", async () => {
+  test("pendingがあれば次のUserPromptSubmitでread→rename指示を注入しturnを相関する", async () => {
     const h = harness({ every: 1, maxChars: 32 });
     await h.controller.handle(stop("s1", "t1"));
 
@@ -167,9 +220,12 @@ describe("HookController", () => {
       hookSpecificOutput: { hookEventName: "UserPromptSubmit" },
     });
     expect(additionalContextOf(output)).toContain("codex_app__set_thread_title");
+    expect(additionalContextOf(output)).toContain("codex_app__read_thread");
+    expect(additionalContextOf(output)).toContain('threadId="s1"');
+    expect(additionalContextOf(output)).toContain("turnLimit=1");
     expect(additionalContextOf(output)).toContain("32文字");
     expect((h.store as StateStore).getSession("s1")).toEqual(
-      expect.objectContaining({ pendingUpdate: false, lastSuccessAt: NOW }),
+      expect.objectContaining({ pendingUpdate: true, lastSuccessAt: null }),
     );
   });
 
@@ -242,6 +298,108 @@ describe("HookController", () => {
     expect(await h.controller.handle(promptSubmit("s1"))).toEqual({});
   });
 
+  test("read_thread確認後だけset_thread_titleを許可し成功タイトルを所有状態へ保存する", async () => {
+    const h = harness({ every: 1 });
+    await h.controller.handle(stop("s1", "stop-1"));
+    await h.controller.handle(promptSubmit("s1", { turn_id: "rename-1" }));
+
+    const readOutput = await h.controller.handle(postReadTitle("s1", "rename-1", "初期タイトル"));
+    expect(additionalContextOf(readOutput)).toContain("書込みを許可");
+    expect(await h.controller.handle(preSetTitle("s1", "rename-1", "自動タイトル"))).toEqual({});
+    expect((h.store as StateStore).getSession("s1")).toEqual(expect.objectContaining({
+      pendingTitle: "自動タイトル",
+      pendingPreviousTitle: "初期タイトル",
+      pendingPreviousTitleKnown: true,
+    }));
+
+    expect(await h.controller.handle(postSetTitle("s1", "rename-1", "自動タイトル"))).toEqual({});
+    expect((h.store as StateStore).getSession("s1")).toEqual(expect.objectContaining({
+      pendingUpdate: false,
+      pendingTitle: null,
+      lastAutoTitle: "自動タイトル",
+      lastSuccessAt: NOW,
+    }));
+  });
+
+  test("前回自動タイトルから変わっていれば手動変更としてsetを機械的に拒否する", async () => {
+    const store = openStore();
+    store.markSuccess("s1", "前回の自動タイトル", "success");
+    store.markPending("s1", "pending");
+    const h = harness({ store });
+    await h.controller.handle(promptSubmit("s1", { turn_id: "rename-2" }));
+
+    const readOutput = await h.controller.handle(postReadTitle("s1", "rename-2", "手動タイトル"));
+    expect(additionalContextOf(readOutput)).toContain("手動タイトル変更を検出");
+    expect(store.getSession("s1")).toEqual(expect.objectContaining({
+      autoUpdateDisabled: true,
+      pendingUpdate: false,
+      lastAutoTitle: "前回の自動タイトル",
+    }));
+    expect(await h.controller.handle(preSetTitle("s1", "rename-2", "上書き候補"))).toMatchObject({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+      },
+    });
+  });
+
+  test("read_threadより先の自動setと同一turnの二重setを拒否する", async () => {
+    const h = harness({ every: 1 });
+    await h.controller.handle(stop("s1", "stop-1"));
+    await h.controller.handle(promptSubmit("s1", { turn_id: "rename-3" }));
+
+    expect(await h.controller.handle(preSetTitle("s1", "rename-3", "早すぎる"))).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    await h.controller.handle(postReadTitle("s1", "rename-3", "初期タイトル"));
+    expect(await h.controller.handle(preSetTitle("s1", "rename-3", "候補"))).toEqual({});
+    expect(await h.controller.handle(preSetTitle("s1", "rename-3", "二重候補"))).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+  });
+
+  test("titlize attempt外の通常setと別task向けtoolは妨げない", async () => {
+    const h = harness({ every: 1 });
+
+    expect(await h.controller.handle(preSetTitle("s1", "normal-turn", "通常変更"))).toEqual({});
+    await h.controller.handle(stop("s1", "stop-1"));
+    await h.controller.handle(promptSubmit("s1", { turn_id: "rename-4" }));
+    expect(await h.controller.handle(preSetTitle("s1", "rename-4", "別task", "s2"))).toEqual({});
+    expect(await h.controller.handle(postReadTitle("s1", "rename-4", "別task", "s2"))).toEqual({});
+  });
+
+  test("read_thread結果を解釈できなければsetを許可せず固定codeだけをログする", async () => {
+    const h = harness({ every: 1 });
+    await h.controller.handle(stop("s1", "stop-1"));
+    await h.controller.handle(promptSubmit("s1", { turn_id: "rename-5" }));
+    const input = postReadTitle("s1", "rename-5", "unused");
+    input.tool_response = { content: [{ type: "text", text: "not-json" }] };
+
+    expect(additionalContextOf(await h.controller.handle(input))).toContain("確認できなかった");
+    expect(h.logs).toEqual(["title_read_failed"]);
+    expect(await h.controller.handle(preSetTitle("s1", "rename-5", "候補"))).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+  });
+
+  test("CallToolResultのtext内JSONからread/set結果を安全に復元する", async () => {
+    const h = harness({ every: 1 });
+    await h.controller.handle(stop("s1", "stop-1"));
+    await h.controller.handle(promptSubmit("s1", { turn_id: "rename-6" }));
+    const read = postReadTitle("s1", "rename-6", "unused");
+    read.tool_response = {
+      content: [{ type: "text", text: JSON.stringify({ thread: { id: "s1", name: "初期" } }) }],
+    };
+    expect(additionalContextOf(await h.controller.handle(read))).toContain("書込みを許可");
+    await h.controller.handle(preSetTitle("s1", "rename-6", "候補"));
+    const set = postSetTitle("s1", "rename-6", "候補");
+    set.tool_response = {
+      content: [{ type: "text", text: JSON.stringify({ threadId: "s1", title: "候補" }) }],
+    };
+    expect(await h.controller.handle(set)).toEqual({});
+    expect((h.store as StateStore).getSession("s1")?.lastAutoTitle).toBe("候補");
+  });
+
   test("別sessionの状態を分離する", async () => {
     const h = harness({ every: 2 });
 
@@ -252,8 +410,8 @@ describe("HookController", () => {
 
     expect(additionalContextOf(await h.controller.handle(promptSubmit("s1")))).not.toBe("");
     expect(additionalContextOf(await h.controller.handle(promptSubmit("s2")))).not.toBe("");
-    expect((h.store as StateStore).getSession("s1")?.pendingUpdate).toBe(false);
-    expect((h.store as StateStore).getSession("s2")?.pendingUpdate).toBe(false);
+    expect((h.store as StateStore).getSession("s1")?.pendingUpdate).toBe(true);
+    expect((h.store as StateStore).getSession("s2")?.pendingUpdate).toBe(true);
   });
 
   test.each(["recordStop", "markPending"] as const)(
@@ -266,29 +424,11 @@ describe("HookController", () => {
     },
   );
 
-  test("UserPromptSubmit側のgetSession失敗を固定ログへ変換する", async () => {
-    const h = harness({ store: throwingStore("getSession") });
+  test("UserPromptSubmit側のbeginRenameAttempt失敗を固定ログへ変換する", async () => {
+    const h = harness({ store: throwingStore("beginRenameAttempt") });
 
     await expect(h.controller.handle(promptSubmit("s1"))).resolves.toEqual({});
     expect(h.logs).toEqual(["state_store_failed"]);
-  });
-
-  test("完了の記録に失敗したら注入せず固定ログへ変換する", async () => {
-    const base = openStore();
-    base.markPending("s1", NOW);
-    const store: HookStateStore = {
-      getSession: (sessionId) => base.getSession(sessionId),
-      recordStop: (sessionId, turnId, now) => base.recordStop(sessionId, turnId, now),
-      markPending: (sessionId, now) => base.markPending(sessionId, now),
-      markRenameContinuationFinished() {
-        throw new Error("database-secret");
-      },
-    };
-    const h = harness({ store });
-
-    await expect(h.controller.handle(promptSubmit("s1"))).resolves.toEqual({});
-    expect(h.logs).toEqual(["state_store_failed"]);
-    expect(base.getSession("s1")?.pendingUpdate).toBe(true);
   });
 
   test("logger自体がthrowしてもHook処理を妨げない", async () => {

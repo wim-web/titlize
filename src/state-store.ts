@@ -17,6 +17,32 @@ type SessionRow = {
   updated_at: string;
 };
 
+type RenameAttemptPhase =
+  | "awaiting_read"
+  | "authorized"
+  | "write_pending"
+  | "denied"
+  | "completed";
+
+type RenameAttemptRow = {
+  session_id: string;
+  turn_id: string;
+  phase: RenameAttemptPhase;
+  observed_title: string | null;
+  observed_title_known: number;
+  updated_at: string;
+};
+
+export type RenameAttemptStart = "started" | "ignored";
+export type CurrentTitleObservation =
+  | "authorized"
+  | "already_applied"
+  | "manual_change"
+  | "disabled"
+  | "ignored";
+export type TitleWriteDecision = "allow" | "deny" | "ignored";
+export type TitleWriteCompletion = "success" | "unverified" | "ignored";
+
 const schema = `
   CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -36,6 +62,17 @@ const schema = `
     session_id TEXT NOT NULL,
     turn_id TEXT NOT NULL,
     PRIMARY KEY(session_id, turn_id),
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+  );
+  CREATE TABLE IF NOT EXISTS rename_attempts (
+    session_id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL,
+    phase TEXT NOT NULL
+      CHECK(phase IN ('awaiting_read', 'authorized', 'write_pending', 'denied', 'completed')),
+    observed_title TEXT,
+    observed_title_known INTEGER NOT NULL DEFAULT 0
+      CHECK(observed_title_known IN (0, 1)),
+    updated_at TEXT NOT NULL,
     FOREIGN KEY(session_id) REFERENCES sessions(session_id)
   )
 `;
@@ -231,6 +268,199 @@ export class StateStore {
     );
   }
 
+  beginRenameAttempt(sessionId: string, turnId: string, now: string): RenameAttemptStart {
+    return this.transaction(() => {
+      const state = this.getSession(sessionId);
+      if (
+        state === undefined ||
+        !state.pendingUpdate ||
+        (state.autoUpdateDisabled && state.pendingTitle === null)
+      ) {
+        return "ignored";
+      }
+
+      const existing = this.getRenameAttempt(sessionId);
+      if (existing?.turn_id === turnId) return "ignored";
+
+      this.db
+        .query(
+          `INSERT INTO rename_attempts (
+             session_id, turn_id, phase, observed_title, observed_title_known, updated_at
+           ) VALUES (?, ?, 'awaiting_read', NULL, 0, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             turn_id = excluded.turn_id,
+             phase = 'awaiting_read',
+             observed_title = NULL,
+             observed_title_known = 0,
+             updated_at = excluded.updated_at`,
+        )
+        .run(sessionId, turnId, now);
+      return "started";
+    });
+  }
+
+  isTitleReadExpected(sessionId: string, turnId: string): boolean {
+    const attempt = this.getRenameAttempt(sessionId);
+    return attempt?.turn_id === turnId && attempt.phase === "awaiting_read";
+  }
+
+  observeCurrentTitle(
+    sessionId: string,
+    turnId: string,
+    currentTitle: string | null,
+    now: string,
+  ): CurrentTitleObservation {
+    return this.transaction(() => {
+      const attempt = this.getRenameAttempt(sessionId);
+      if (attempt?.turn_id !== turnId || attempt.phase !== "awaiting_read") {
+        return "ignored";
+      }
+
+      let state = this.getSession(sessionId);
+      if (state === undefined) return "ignored";
+
+      if (state.pendingTitle !== null) {
+        if (currentTitle === state.pendingTitle) {
+          this.db
+            .query(
+              `UPDATE sessions SET
+                 pending_update = 0,
+                 last_auto_title = pending_title,
+                 pending_title = NULL,
+                 pending_previous_title = NULL,
+                 pending_previous_title_known = 0,
+                 last_success_at = ?,
+                 updated_at = ?
+               WHERE session_id = ?`,
+            )
+            .run(now, now, sessionId);
+          this.finishRenameAttempt(sessionId, turnId, "completed", now);
+          return "already_applied";
+        }
+
+        if (
+          state.pendingPreviousTitleKnown &&
+          currentTitle === state.pendingPreviousTitle
+        ) {
+          this.db
+            .query(
+              `UPDATE sessions SET
+                 pending_title = NULL,
+                 pending_previous_title = NULL,
+                 pending_previous_title_known = 0,
+                 updated_at = ?
+               WHERE session_id = ?`,
+            )
+            .run(now, sessionId);
+          state = this.requireSession(sessionId);
+        } else {
+          this.disableAutoUpdate(sessionId, now);
+          this.finishRenameAttempt(sessionId, turnId, "denied", now);
+          return "manual_change";
+        }
+      }
+
+      if (state.autoUpdateDisabled) {
+        this.db
+          .query("UPDATE sessions SET pending_update = 0, updated_at = ? WHERE session_id = ?")
+          .run(now, sessionId);
+        this.finishRenameAttempt(sessionId, turnId, "denied", now);
+        return "disabled";
+      }
+
+      if (state.lastAutoTitle !== null && currentTitle !== state.lastAutoTitle) {
+        this.disableAutoUpdate(sessionId, now);
+        this.finishRenameAttempt(sessionId, turnId, "denied", now);
+        return "manual_change";
+      }
+
+      this.db
+        .query(
+          `UPDATE rename_attempts SET
+             phase = 'authorized', observed_title = ?, observed_title_known = 1, updated_at = ?
+           WHERE session_id = ? AND turn_id = ?`,
+        )
+        .run(currentTitle, now, sessionId, turnId);
+      return "authorized";
+    });
+  }
+
+  prepareTitleWrite(
+    sessionId: string,
+    turnId: string,
+    title: string,
+    now: string,
+  ): TitleWriteDecision {
+    return this.transaction(() => {
+      const attempt = this.getRenameAttempt(sessionId);
+      if (attempt?.turn_id !== turnId) return "ignored";
+      if (attempt.phase !== "authorized" || attempt.observed_title_known !== 1) {
+        return "deny";
+      }
+
+      const state = this.getSession(sessionId);
+      if (state === undefined || state.autoUpdateDisabled) {
+        this.finishRenameAttempt(sessionId, turnId, "denied", now);
+        return "deny";
+      }
+
+      this.db
+        .query(
+          `UPDATE sessions SET
+             pending_update = 1,
+             pending_title = ?,
+             pending_previous_title = ?,
+             pending_previous_title_known = 1,
+             updated_at = ?
+           WHERE session_id = ?`,
+        )
+        .run(title, attempt.observed_title, now, sessionId);
+      this.finishRenameAttempt(sessionId, turnId, "write_pending", now);
+      return "allow";
+    });
+  }
+
+  completeTitleWrite(
+    sessionId: string,
+    turnId: string,
+    succeeded: boolean,
+    now: string,
+  ): TitleWriteCompletion {
+    return this.transaction(() => {
+      const attempt = this.getRenameAttempt(sessionId);
+      if (attempt?.turn_id !== turnId || attempt.phase !== "write_pending") {
+        return "ignored";
+      }
+
+      const state = this.getSession(sessionId);
+      if (state === undefined || state.pendingTitle === null) {
+        this.finishRenameAttempt(sessionId, turnId, "completed", now);
+        return "unverified";
+      }
+
+      if (!succeeded) {
+        this.finishRenameAttempt(sessionId, turnId, "completed", now);
+        return "unverified";
+      }
+
+      this.db
+        .query(
+          `UPDATE sessions SET
+             pending_update = 0,
+             last_auto_title = pending_title,
+             pending_title = NULL,
+             pending_previous_title = NULL,
+             pending_previous_title_known = 0,
+             last_success_at = ?,
+             updated_at = ?
+           WHERE session_id = ?`,
+        )
+        .run(now, now, sessionId);
+      this.finishRenameAttempt(sessionId, turnId, "completed", now);
+      return "success";
+    });
+  }
+
   private upsert(
     sessionId: string,
     now: string,
@@ -264,6 +494,60 @@ export class StateStore {
         now,
       );
     return this.requireSession(sessionId);
+  }
+
+  private transaction<T>(operation: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Preserve the operation failure rather than a cleanup failure.
+      }
+      throw error;
+    }
+  }
+
+  private getRenameAttempt(sessionId: string): RenameAttemptRow | undefined {
+    const row = this.db
+      .query<RenameAttemptRow, [string]>(
+        "SELECT * FROM rename_attempts WHERE session_id = ?",
+      )
+      .get(sessionId);
+    return row === null ? undefined : row;
+  }
+
+  private finishRenameAttempt(
+    sessionId: string,
+    turnId: string,
+    phase: RenameAttemptPhase,
+    now: string,
+  ): void {
+    this.db
+      .query(
+        `UPDATE rename_attempts SET phase = ?, updated_at = ?
+         WHERE session_id = ? AND turn_id = ?`,
+      )
+      .run(phase, now, sessionId, turnId);
+  }
+
+  private disableAutoUpdate(sessionId: string, now: string): void {
+    this.db
+      .query(
+        `UPDATE sessions SET
+           pending_update = 0,
+           pending_title = NULL,
+           pending_previous_title = NULL,
+           pending_previous_title_known = 0,
+           auto_update_disabled = 1,
+           updated_at = ?
+         WHERE session_id = ?`,
+      )
+      .run(now, sessionId);
   }
 
   private migrateTitleIntentColumns(): void {

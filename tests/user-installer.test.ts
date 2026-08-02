@@ -32,7 +32,7 @@ async function fixture() {
 
 function titlizeHandlers(
   config: Record<string, any>,
-  eventName: "Stop" | "UserPromptSubmit",
+  eventName: "Stop" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse",
 ): Array<Record<string, any>> {
   return (config.hooks?.[eventName] ?? []).flatMap((group: Record<string, any>) =>
     (group.hooks ?? []).filter(
@@ -49,7 +49,7 @@ describe("user installer", () => {
     );
   });
 
-  test("既存Hookを保持して全プロジェクト向けStop/UserPromptSubmit Hookと単体CLIを追加する", async () => {
+  test("既存Hookを保持して更新・タイトル確認・書込み保護Hookと単体CLIを追加する", async () => {
     const { codexHome, cliSource, binDirectory } = await fixture();
     await mkdir(codexHome, { recursive: true });
     const existing = {
@@ -120,6 +120,20 @@ describe("user installer", () => {
       statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
     });
     expect(promptHandlers[0]?.command).toBe(`'${join(binDirectory, "titlize")}' hook`);
+
+    const preToolHandlers = titlizeHandlers(installed, "PreToolUse");
+    expect(preToolHandlers).toHaveLength(1);
+    expect(installed.hooks.PreToolUse.at(-1).matcher).toBe(
+      "^codex_app__set_thread_title$",
+    );
+
+    const postToolHandlers = titlizeHandlers(installed, "PostToolUse");
+    expect(postToolHandlers).toHaveLength(2);
+    expect(installed.hooks.PostToolUse.slice(-2).map((group: Record<string, any>) => group.matcher))
+      .toEqual([
+        "^codex_app__read_thread$",
+        "^codex_app__set_thread_title$",
+      ]);
   });
 
   test("再インストールしてもtitlize Hookを重複させない", async () => {
@@ -140,6 +154,8 @@ describe("user installer", () => {
     const installed = JSON.parse(await readFile(join(codexHome, "hooks.json"), "utf8"));
     expect(titlizeHandlers(installed, "Stop")).toHaveLength(1);
     expect(titlizeHandlers(installed, "UserPromptSubmit")).toHaveLength(1);
+    expect(titlizeHandlers(installed, "PreToolUse")).toHaveLength(1);
+    expect(titlizeHandlers(installed, "PostToolUse")).toHaveLength(2);
     expect(await readFile(join(binDirectory, "titlize"), "utf8")).toBe("updated-cli\n");
     expect(await readFile(configPath, "utf8")).toBe(customConfig);
   });
@@ -202,8 +218,12 @@ describe("user installer", () => {
     const uninstalled = JSON.parse(await readFile(hooksPath, "utf8"));
     expect(titlizeHandlers(uninstalled, "Stop")).toHaveLength(0);
     expect(titlizeHandlers(uninstalled, "UserPromptSubmit")).toHaveLength(0);
+    expect(titlizeHandlers(uninstalled, "PreToolUse")).toHaveLength(0);
+    expect(titlizeHandlers(uninstalled, "PostToolUse")).toHaveLength(0);
     expect(uninstalled.hooks.Stop).toBeUndefined();
     expect(uninstalled.hooks.UserPromptSubmit).toBeUndefined();
+    expect(uninstalled.hooks.PreToolUse).toBeUndefined();
+    expect(uninstalled.hooks.PostToolUse).toBeUndefined();
     expect(uninstalled.hooks.SessionStart).toHaveLength(1);
     expect(await Bun.file(join(binDirectory, "titlize")).exists()).toBe(false);
     expect(await readFile(configPath, "utf8")).toBe(customConfig);
