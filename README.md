@@ -23,7 +23,7 @@ bun install
 bun run install:user
 ```
 
-`${TITLIZE_INSTALL_DIR:-~/.local/bin}/titlize`と`${CODEX_HOME:-~/.codex}/hooks.json`を更新します。既存の他のHookは保持し、titlizeの`Stop`と`UserPromptSubmit`だけを追加・更新します。
+`${TITLIZE_INSTALL_DIR:-~/.local/bin}/titlize`と`${CODEX_HOME:-~/.codex}/hooks.json`を更新し、未作成なら`${CODEX_HOME:-~/.codex}/titlize.json`を作成します。既存の他のHookと既存のtitlize設定は保持し、titlizeの`Stop`と`UserPromptSubmit`だけを追加・更新します。
 
 インストール後、Codexの`/hooks`でtitlizeのHook（2件）を信頼してください。信頼されていないHookは実行されません。
 
@@ -31,13 +31,24 @@ bun run install:user
 
 ## 設定
 
-| 環境変数 | 既定値 | 説明 |
-| --- | --- | --- |
-| `CODEX_TITLE_EVERY` | `3` | 何回目の通常`Stop`で更新を予約するか |
-| `CODEX_TITLE_MAX_CHARS` | `40` | タイトルの最大文字数 |
-| `CODEX_TITLE_STATE_PATH` | `${CODEX_HOME:-~/.codex}/codex-title/state.sqlite3` | SQLite状態ファイル |
+`${CODEX_HOME:-~/.codex}/titlize.json`を編集します。初回インストール時の内容は次のとおりです。
 
-整数設定は正の10進安全整数だけを受け入れます。
+```json
+{
+  "every": 3,
+  "maxChars": 40
+}
+```
+
+| 設定キー | 環境変数での上書き | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| `every` | `CODEX_TITLE_EVERY` | `3` | 何回目の通常`Stop`で更新を予約するか |
+| `maxChars` | `CODEX_TITLE_MAX_CHARS` | `40` | タイトルの最大文字数 |
+| `statePath` | `CODEX_TITLE_STATE_PATH` | `${CODEX_HOME:-~/.codex}/codex-title/state.sqlite3` | SQLite状態ファイル |
+
+優先順位は「環境変数 > 設定ファイル > 既定値」です。設定ファイルの場所だけを変える場合は`CODEX_TITLE_CONFIG_PATH`を使えます。再インストールとアンインストールでは既存の設定ファイルを削除・上書きしません。
+
+JSONの整数設定は正の安全整数、環境変数の整数設定は正の10進安全整数だけを受け入れます。未知のキー、不正なJSON、空の`statePath`は設定エラーになります。
 
 ## 注意点
 

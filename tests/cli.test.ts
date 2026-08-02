@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +15,12 @@ import {
 } from "../src/cli";
 
 const temporaryDirectories: string[] = [];
+const NO_CONFIG_ENV = {
+  CODEX_TITLE_CONFIG_PATH: join(
+    tmpdir(),
+    `titlize-missing-config-${process.pid}-${randomUUID()}.json`,
+  ),
+};
 
 afterEach(async () => {
   while (temporaryDirectories.length > 0) {
@@ -169,7 +176,7 @@ describe("main hook", () => {
       }),
     });
 
-    await expect(main(["hook"], {}, h.dependencies)).resolves.toBe(0);
+    await expect(main(["hook"], NO_CONFIG_ENV, h.dependencies)).resolves.toBe(0);
     expect(handled).toEqual([input]);
     expect(h.stdout).toEqual(["{}\n"]);
     expect(h.stderr).toEqual([]);
@@ -186,7 +193,7 @@ describe("main hook", () => {
       runtime: fakeRuntime({ async handle() { return output; } }),
     });
 
-    await expect(main(["hook"], {}, h.dependencies)).resolves.toBe(0);
+    await expect(main(["hook"], NO_CONFIG_ENV, h.dependencies)).resolves.toBe(0);
     expect(h.stdout).toEqual([`${JSON.stringify(output)}\n`]);
   });
 
@@ -212,7 +219,7 @@ describe("main hook", () => {
   ])("不正stdin (%s)でもstdout契約とexit 0を守る", async (_name, input) => {
     const h = cliHarness({ stdin: streamFrom(input) });
 
-    await expect(main(["hook"], {}, h.dependencies)).resolves.toBe(0);
+    await expect(main(["hook"], NO_CONFIG_ENV, h.dependencies)).resolves.toBe(0);
     expect(h.counts.runtimeCreations).toBe(0);
     expect(h.stdout).toEqual(["{}\n"]);
     expect(h.stderr).toEqual(["codex-title: hook_input_invalid\n"]);
@@ -222,7 +229,11 @@ describe("main hook", () => {
     const h = cliHarness();
 
     await expect(
-      main(["hook"], { CODEX_TITLE_EVERY: "not-a-number" }, h.dependencies),
+      main(
+        ["hook"],
+        { ...NO_CONFIG_ENV, CODEX_TITLE_EVERY: "not-a-number" },
+        h.dependencies,
+      ),
     ).resolves.toBe(0);
     expect(h.counts.runtimeCreations).toBe(0);
     expect(h.stdout).toEqual(["{}\n"]);
@@ -236,7 +247,7 @@ describe("main hook", () => {
       },
     });
 
-    await expect(main(["hook"], {}, h.dependencies)).resolves.toBe(0);
+    await expect(main(["hook"], NO_CONFIG_ENV, h.dependencies)).resolves.toBe(0);
     expect(h.stdout).toEqual(["{}\n"]);
     expect(h.stderr).toEqual(["codex-title: hook_runtime_failed\n"]);
     expect(h.stderr.join("")).not.toContain("secret");
@@ -255,7 +266,7 @@ describe("main hook", () => {
       }),
     });
 
-    await expect(main(["hook"], {}, h.dependencies)).resolves.toBe(0);
+    await expect(main(["hook"], NO_CONFIG_ENV, h.dependencies)).resolves.toBe(0);
     expect(closes).toBe(1);
     expect(h.stdout).toEqual(["{}\n"]);
     expect(h.stderr).toEqual(["codex-title: hook_execution_failed\n"]);
@@ -273,7 +284,7 @@ describe("main hook", () => {
       },
     });
 
-    await expect(main(["hook"], {}, h.dependencies)).resolves.toBe(0);
+    await expect(main(["hook"], NO_CONFIG_ENV, h.dependencies)).resolves.toBe(0);
     expect(h.stderr).toEqual(["codex-title: state_store_failed\n"]);
   });
 
@@ -288,7 +299,7 @@ describe("main hook", () => {
       }),
     });
 
-    await expect(main(["hook"], {}, h.dependencies)).resolves.toBe(0);
+    await expect(main(["hook"], NO_CONFIG_ENV, h.dependencies)).resolves.toBe(0);
     expect(h.stdout).toEqual(["{}\n"]);
     expect(h.stderr).toEqual(["codex-title: state_close_failed\n"]);
   });
@@ -315,7 +326,7 @@ describe("composeRuntime", () => {
       CODEX_TITLE_STATE_PATH: ":memory:",
       CODEX_TITLE_MAX_CHARS: "31",
       CODEX_TITLE_EVERY: "5",
-    });
+    }, { readFile: () => undefined });
     const store = { close() {} };
     const controller = { handle: async () => ({}) };
     const captures: Record<string, unknown> = {};
@@ -347,7 +358,10 @@ describe("composeRuntime", () => {
     let closes = 0;
 
     expect(() =>
-      composeRuntime(loadConfig({ CODEX_TITLE_STATE_PATH: ":memory:" }), () => undefined, {
+      composeRuntime(loadConfig(
+        { CODEX_TITLE_STATE_PATH: ":memory:" },
+        { readFile: () => undefined },
+      ), () => undefined, {
         createStateStore() {
           return {
             close() {
@@ -371,7 +385,11 @@ describe("direct CLI", () => {
     const statePath = join(root, "state.sqlite3");
     const child = Bun.spawn(["bun", "src/cli.ts", "hook"], {
       cwd: join(import.meta.dir, ".."),
-      env: { ...process.env, CODEX_TITLE_STATE_PATH: statePath },
+      env: {
+        ...process.env,
+        CODEX_TITLE_CONFIG_PATH: join(root, "missing-config.json"),
+        CODEX_TITLE_STATE_PATH: statePath,
+      },
       stdin: new Blob([JSON.stringify({ hook_event_name: "SessionStart" })]),
       stdout: "pipe",
       stderr: "pipe",

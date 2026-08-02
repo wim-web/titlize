@@ -30,6 +30,7 @@ export async function main(
       const result = await uninstallUser({ codexHome, binDirectory });
       console.log(`titlize CLIを削除しました: ${result.cliPath}`);
       console.log(`ユーザー共通Hookを更新しました: ${result.hooksPath}`);
+      console.log(`設定ファイルは保持しました: ${result.configPath}`);
       return 0;
     }
 
@@ -42,6 +43,7 @@ export async function main(
     const result = await installUser({ codexHome, binDirectory, cliSource });
     console.log(`titlize CLIをインストールしました: ${result.cliPath}`);
     console.log(`ユーザー共通Hookを更新しました: ${result.hooksPath}`);
+    console.log(`設定ファイル: ${result.configPath}`);
     console.log("Codexで /hooks を開き、titlizeのStopとUserPromptSubmitのHookを信頼してください。");
     return 0;
   } catch (error) {
