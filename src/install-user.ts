@@ -42,7 +42,7 @@ export async function main(
     const result = await installUser({ codexHome, binDirectory, cliSource });
     console.log(`titlize CLIをインストールしました: ${result.cliPath}`);
     console.log(`ユーザー共通Hookを更新しました: ${result.hooksPath}`);
-    console.log("Codexで /hooks を開き、titlizeのStop Hookを信頼してください。");
+    console.log("Codexで /hooks を開き、titlizeのStopとUserPromptSubmitのHookを信頼してください。");
     return 0;
   } catch (error) {
     const code =

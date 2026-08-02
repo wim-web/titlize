@@ -1,33 +1,14 @@
-import { isAbsolute } from "node:path";
-import {
-  AppServerClient,
-  type AppServerRpcClient,
-} from "./app-server-client";
-import { AppServerTitleSink } from "./app-server-title-sink";
-import { CodexTitleProvider } from "./codex-title-provider";
 import { loadConfig } from "./config";
 import {
   HookController,
   type HookControllerOptions,
   type HookLogCode,
+  type HookOutput,
   type HookStateStore,
-  type HookTitleUpdateService,
 } from "./hook-controller";
 import { StateStore } from "./state-store";
-import {
-  TitleUpdateService,
-  type TitleUpdateRequest,
-  type TitleUpdateResult,
-  type TitleUpdateServiceOptions,
-  type TitleUpdateSink,
-  type TitleUpdateStateStore,
-  type TitleUpdateTranscriptReader,
-} from "./title-update-service";
-import { TranscriptReader } from "./transcript-reader";
-import type { TitleConfig, TitleProvider } from "./types";
+import type { TitleConfig } from "./types";
 
-const MAX_ID_CODE_UNITS = 4_096;
-const MAX_TRANSCRIPT_PATH_CODE_UNITS = 4_096;
 export const MAX_HOOK_INPUT_BYTES = 1024 * 1024;
 
 export type CliErrorCode = "invalid_arguments" | "invalid_hook_input";
@@ -48,60 +29,11 @@ export class CliError extends Error {
   }
 }
 
-export type CliCommand =
-  | { command: "hook" }
-  | {
-      command: "update";
-      sessionId: string;
-      transcriptPath?: string;
-      force: true;
-    };
+export type CliCommand = { command: "hook" };
 
 export function parseCliArgs(args: readonly string[]): CliCommand {
-  try {
-    if (args.length === 1 && args[0] === "hook") return { command: "hook" };
-    if (args[0] !== "update") throw new Error();
-
-    let sessionId: string | undefined;
-    let transcriptPath: string | undefined;
-    let force = false;
-    const seen = new Set<string>();
-
-    for (let index = 1; index < args.length; index += 1) {
-      const flag = args[index];
-      if (flag !== "--session-id" && flag !== "--transcript-path" && flag !== "--force") {
-        throw new Error();
-      }
-      if (seen.has(flag)) throw new Error();
-      seen.add(flag);
-
-      if (flag === "--force") {
-        force = true;
-        continue;
-      }
-
-      const value = args[index + 1];
-      if (value === undefined || value.startsWith("--")) throw new Error();
-      index += 1;
-      if (flag === "--session-id") sessionId = value;
-      else transcriptPath = value;
-    }
-
-    if (!force || !isBoundedId(sessionId)) throw new Error();
-    if (
-      transcriptPath !== undefined &&
-      (!isBoundedString(transcriptPath, MAX_TRANSCRIPT_PATH_CODE_UNITS) ||
-        !isAbsolute(transcriptPath))
-    ) {
-      throw new Error();
-    }
-
-    return transcriptPath === undefined
-      ? { command: "update", sessionId, force: true }
-      : { command: "update", sessionId, transcriptPath, force: true };
-  } catch {
-    throw CliError.for("invalid_arguments");
-  }
+  if (args.length === 1 && args[0] === "hook") return { command: "hook" };
+  throw CliError.for("invalid_arguments");
 }
 
 export async function readHookInput(
@@ -148,7 +80,7 @@ export async function readHookInput(
   }
 }
 
-export interface CliStateStore extends HookStateStore, TitleUpdateStateStore {
+export interface CliStateStore extends HookStateStore {
   close(): void;
 }
 
@@ -158,47 +90,22 @@ export interface CliRuntime {
     handle(
       input: unknown,
       env?: Readonly<Record<string, string | undefined>>,
-    ): Promise<void>;
-  };
-  service: {
-    update(input: TitleUpdateRequest): Promise<TitleUpdateResult>;
+    ): Promise<HookOutput>;
   };
 }
 
 export interface RuntimeFactories {
   createStateStore(path: string): CliStateStore;
-  createTranscriptReader(): TitleUpdateTranscriptReader;
-  createProvider(options: {
-    model: string;
-    timeoutMs: number;
-    baseEnv: Record<string, string | undefined>;
-  }): TitleProvider;
-  createAppServerClient(options: { timeoutMs: number }): AppServerRpcClient;
-  createTitleSink(client: AppServerRpcClient): TitleUpdateSink;
-  createService(options: TitleUpdateServiceOptions): HookTitleUpdateService & {
-    update(input: TitleUpdateRequest): Promise<TitleUpdateResult>;
-  };
-  createController(options: HookControllerOptions): {
-    handle(
-      input: unknown,
-      env?: Readonly<Record<string, string | undefined>>,
-    ): Promise<void>;
-  };
+  createController(options: HookControllerOptions): CliRuntime["controller"];
 }
 
 const DEFAULT_RUNTIME_FACTORIES: RuntimeFactories = {
   createStateStore: (path) => new StateStore(path),
-  createTranscriptReader: () => new TranscriptReader(),
-  createProvider: (options) => new CodexTitleProvider(options),
-  createAppServerClient: (options) => new AppServerClient(options),
-  createTitleSink: (client) => new AppServerTitleSink(client),
-  createService: (options) => new TitleUpdateService(options),
   createController: (options) => new HookController(options),
 };
 
 export function composeRuntime(
   config: TitleConfig,
-  env: Record<string, string | undefined>,
   logger: (code: HookLogCode) => void,
   overrides: Partial<RuntimeFactories> = {},
 ): CliRuntime {
@@ -206,31 +113,14 @@ export function composeRuntime(
   let store: CliStateStore | undefined;
   try {
     store = factories.createStateStore(config.statePath);
-    const transcriptReader = factories.createTranscriptReader();
-    const provider = factories.createProvider({
-      model: config.model,
-      timeoutMs: config.timeoutMs,
-      baseEnv: env,
-    });
-    const client = factories.createAppServerClient({ timeoutMs: config.timeoutMs });
-    const sink = factories.createTitleSink(client);
-    const clock = (): string => new Date().toISOString();
-    const service = factories.createService({
-      store,
-      provider,
-      transcriptReader,
-      sink,
-      maxChars: config.maxChars,
-      clock,
-    });
     const controller = factories.createController({
       store,
-      service,
       every: config.every,
-      clock,
+      maxChars: config.maxChars,
+      clock: (): string => new Date().toISOString(),
       logger,
     });
-    return { store, service, controller };
+    return { store, controller };
   } catch (error) {
     try {
       store?.close();
@@ -247,7 +137,6 @@ export interface CliDependencies {
   writeStderr?: (value: string) => void | Promise<void>;
   createRuntime?: (
     config: TitleConfig,
-    env: Record<string, string | undefined>,
     logger: (code: HookLogCode) => void,
   ) => CliRuntime;
 }
@@ -265,19 +154,17 @@ type CliLogCode =
   | "hook_input_invalid"
   | "hook_runtime_failed"
   | "hook_execution_failed"
-  | "state_close_failed"
-  | "update_failed";
+  | "state_close_failed";
 
 const CLI_LOG_LINES: Record<CliLogCode, string> = {
   invalid_stop_input: "codex-title: invalid_stop_input\n",
+  invalid_prompt_input: "codex-title: invalid_prompt_input\n",
   state_store_failed: "codex-title: state_store_failed\n",
-  title_update_failed: "codex-title: title_update_failed\n",
   invalid_arguments: "codex-title: invalid_arguments\n",
   hook_input_invalid: "codex-title: hook_input_invalid\n",
   hook_runtime_failed: "codex-title: hook_runtime_failed\n",
   hook_execution_failed: "codex-title: hook_execution_failed\n",
   state_close_failed: "codex-title: state_close_failed\n",
-  update_failed: "codex-title: update_failed\n",
 };
 
 export async function main(
@@ -286,17 +173,13 @@ export async function main(
   dependencies: CliDependencies = {},
 ): Promise<number> {
   const resolved = resolveDependencies(dependencies);
-  let command: CliCommand;
   try {
-    command = parseCliArgs(args);
+    parseCliArgs(args);
   } catch {
     await safeWriteLog(resolved.writeStderr, "invalid_arguments");
     return 2;
   }
-
-  return command.command === "hook"
-    ? runHookCommand(env, resolved)
-    : runUpdateCommand(command, env, resolved);
+  return runHookCommand(env, resolved);
 }
 
 async function runHookCommand(
@@ -308,6 +191,7 @@ async function runHookCommand(
     pendingLogs.push(safeWriteLog(dependencies.writeStderr, code));
   };
   let runtime: CliRuntime | undefined;
+  let hookOutput: HookOutput = {};
 
   try {
     if (env.CODEX_TITLE_CHILD === "1") return 0;
@@ -323,14 +207,14 @@ async function runHookCommand(
     let config: TitleConfig;
     try {
       config = loadConfig(env);
-      runtime = dependencies.createRuntime(config, env, queueLog);
+      runtime = dependencies.createRuntime(config, queueLog);
     } catch {
       pendingLogs.push(safeWriteLog(dependencies.writeStderr, "hook_runtime_failed"));
       return 0;
     }
 
     try {
-      await runtime.controller.handle(input, env);
+      hookOutput = await runtime.controller.handle(input, env);
     } catch {
       pendingLogs.push(safeWriteLog(dependencies.writeStderr, "hook_execution_failed"));
     }
@@ -344,47 +228,8 @@ async function runHookCommand(
       }
     }
     await Promise.all(pendingLogs);
-    await safeWrite(dependencies.writeStdout, "{}\n");
+    await safeWrite(dependencies.writeStdout, `${JSON.stringify(hookOutput)}\n`);
   }
-}
-
-async function runUpdateCommand(
-  command: Extract<CliCommand, { command: "update" }>,
-  env: Record<string, string | undefined>,
-  dependencies: ResolvedCliDependencies,
-): Promise<number> {
-  const pendingLogs: Promise<void>[] = [];
-  const queueLog = (code: HookLogCode): void => {
-    pendingLogs.push(safeWriteLog(dependencies.writeStderr, code));
-  };
-  let runtime: CliRuntime | undefined;
-  let exitCode = 0;
-
-  try {
-    const config = loadConfig(env);
-    runtime = dependencies.createRuntime(config, env, queueLog);
-    await runtime.service.update({
-      sessionId: command.sessionId,
-      ...(command.transcriptPath === undefined
-        ? {}
-        : { transcriptPath: command.transcriptPath }),
-      force: true,
-    });
-  } catch {
-    exitCode = 1;
-    pendingLogs.push(safeWriteLog(dependencies.writeStderr, "update_failed"));
-  } finally {
-    if (runtime !== undefined) {
-      try {
-        runtime.store.close();
-      } catch {
-        exitCode = 1;
-        pendingLogs.push(safeWriteLog(dependencies.writeStderr, "state_close_failed"));
-      }
-    }
-    await Promise.all(pendingLogs);
-  }
-  return exitCode;
 }
 
 function resolveDependencies(dependencies: CliDependencies): ResolvedCliDependencies {
@@ -398,7 +243,7 @@ function resolveDependencies(dependencies: CliDependencies): ResolvedCliDependen
     }),
     createRuntime:
       dependencies.createRuntime ??
-      ((config, env, logger) => composeRuntime(config, env, logger)),
+      ((config, logger) => composeRuntime(config, logger)),
   };
 }
 
@@ -418,19 +263,6 @@ async function safeWrite(
   } catch {
     // Hook output/log failures cannot be repaired safely without risking duplicates.
   }
-}
-
-function isBoundedId(value: unknown): value is string {
-  return isBoundedString(value, MAX_ID_CODE_UNITS) && value.trim().length > 0;
-}
-
-function isBoundedString(value: unknown, maxCodeUnits: number): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value.length <= maxCodeUnits &&
-    !value.includes("\0")
-  );
 }
 
 if (import.meta.main) {

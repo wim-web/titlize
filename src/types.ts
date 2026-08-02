@@ -1,19 +1,3 @@
-export interface NormalizedMessage {
-  role: "user" | "assistant";
-  content: string;
-}
-
-export interface TitleProviderInput {
-  messages: NormalizedMessage[];
-  previousTitle?: string;
-  locale: "ja";
-  maxChars: number;
-}
-
-export interface TitleProvider {
-  generateTitle(input: TitleProviderInput): Promise<string>;
-}
-
 export interface SessionState {
   sessionId: string;
   stopCount: number;
@@ -30,10 +14,6 @@ export interface SessionState {
 
 export interface TitleConfig {
   every: number;
-  provider: "codex";
-  model: string;
   maxChars: number;
-  timeoutMs: number;
   statePath: string;
-  appServer: "stdio://";
 }

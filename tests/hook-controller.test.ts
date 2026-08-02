@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { HookController, type HookLogCode, type HookTitleUpdateService } from "../src/hook-controller";
+import {
+  HookController,
+  type HookLogCode,
+  type HookOutput,
+  type HookStateStore,
+} from "../src/hook-controller";
 import { StateStore } from "../src/state-store";
 
 const NOW = "2026-08-02T01:02:03.000Z";
@@ -18,70 +23,86 @@ afterEach(() => {
 function stop(
   sessionId: string,
   turnId: string,
-  transcriptPath: string | null = "/tmp/rollout.jsonl",
+  options: { transcriptPath?: string | null; stopHookActive?: boolean } = {},
 ): Record<string, unknown> {
   return {
     hook_event_name: "Stop",
     session_id: sessionId,
     turn_id: turnId,
-    transcript_path: transcriptPath,
+    transcript_path: options.transcriptPath ?? "/tmp/rollout.jsonl",
+    ...(options.stopHookActive === undefined
+      ? {}
+      : { stop_hook_active: options.stopHookActive }),
     last_assistant_message: "未知追加field",
   };
 }
 
+function promptSubmit(
+  sessionId: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    hook_event_name: "UserPromptSubmit",
+    session_id: sessionId,
+    prompt: "次の依頼",
+    ...extra,
+  };
+}
+
+function additionalContextOf(output: HookOutput): string {
+  return "hookSpecificOutput" in output ? output.hookSpecificOutput.additionalContext : "";
+}
+
 function harness(options: {
   every?: number;
-  store?: Pick<StateStore, "recordStop">;
-  update?: HookTitleUpdateService["update"];
+  maxChars?: number;
+  store?: HookStateStore;
   logger?: (code: HookLogCode) => void;
   clock?: () => string;
 } = {}) {
   const store = options.store ?? openStore();
-  const updates: unknown[] = [];
   const logs: HookLogCode[] = [];
-  const service: HookTitleUpdateService = {
-    async update(input) {
-      updates.push(structuredClone(input));
-      return options.update ? options.update(input) : { status: "updated" };
-    },
-  };
   const controller = new HookController({
     store,
-    service,
     every: options.every ?? 3,
+    maxChars: options.maxChars ?? 40,
     clock: options.clock ?? (() => NOW),
     logger: options.logger ?? ((code) => logs.push(code)),
   });
-  return { controller, store, updates, logs };
+  return { controller, store, logs };
+}
+
+function throwingStore(operation: keyof HookStateStore): HookStateStore {
+  const base = openStore();
+  return {
+    getSession: (sessionId) => base.getSession(sessionId),
+    recordStop: (sessionId, turnId, now) => base.recordStop(sessionId, turnId, now),
+    markPending: (sessionId, now) => base.markPending(sessionId, now),
+    markRenameContinuationFinished: (sessionId, now) =>
+      base.markRenameContinuationFinished(sessionId, now),
+    [operation](): never {
+      throw new Error("database-secret");
+    },
+  } as HookStateStore;
 }
 
 describe("HookController", () => {
   test("CODEX_TITLE_CHILD=1ならinputに一切触れず即終了する", async () => {
-    const h = harness({
-      store: {
-        recordStop() {
-          throw new Error("must not call");
-        },
-      },
-    });
     const input = new Proxy({}, { get() { throw new Error("must not inspect"); } });
+    const h = harness({ store: throwingStore("recordStop") });
 
-    await expect(h.controller.handle(input, { CODEX_TITLE_CHILD: "1" })).resolves.toBeUndefined();
-    expect(h.updates).toEqual([]);
+    await expect(h.controller.handle(input, { CODEX_TITLE_CHILD: "1" })).resolves.toEqual({});
     expect(h.logs).toEqual([]);
   });
 
   test.each([
-    ["別event", { hook_event_name: "UserPromptSubmit", session_id: null }],
+    ["別event", { hook_event_name: "SessionStart", session_id: null }],
     ["event欠落", { session_id: "s1" }],
     ["非object", null],
-  ])("Stop以外（%s）は他fieldを検証せず何もしない", async (_name, input) => {
-    const h = harness({
-      store: { recordStop() { throw new Error("must not call"); } },
-    });
+  ])("対象外イベント（%s）は他fieldを検証せず何もしない", async (_name, input) => {
+    const h = harness({ store: throwingStore("recordStop") });
 
-    await expect(h.controller.handle(input)).resolves.toBeUndefined();
-    expect(h.updates).toEqual([]);
+    await expect(h.controller.handle(input)).resolves.toEqual({});
     expect(h.logs).toEqual([]);
   });
 
@@ -92,163 +113,136 @@ describe("HookController", () => {
     ["session型", { hook_event_name: "Stop", session_id: 1, turn_id: "t1", transcript_path: null }],
     ["turn型", { hook_event_name: "Stop", session_id: "s1", turn_id: null, transcript_path: null }],
     ["transcript型", { hook_event_name: "Stop", session_id: "s1", turn_id: "t1", transcript_path: 42 }],
+    ["stop_hook_active型", { ...stop("s1", "t1"), stop_hook_active: "yes" }],
     ["空session", stop("", "t1")],
     ["空turn", stop("s1", "")],
     ["NUL session", stop("s\0secret", "t1")],
     ["NUL turn", stop("s1", "t\0secret")],
     ["長いsession", stop("s".repeat(4097), "t1")],
     ["長いturn", stop("s1", "t".repeat(4097))],
-    ["相対path", stop("s1", "t1", "secret.jsonl")],
-    ["空path", stop("s1", "t1", "")],
-    ["NUL path", stop("s1", "t1", "/tmp/secret\0.jsonl")],
-    ["長いpath", stop("s1", "t1", `/${"p".repeat(4096)}`)],
+    ["相対path", stop("s1", "t1", { transcriptPath: "secret.jsonl" })],
+    ["空path", stop("s1", "t1", { transcriptPath: "" })],
+    ["NUL path", stop("s1", "t1", { transcriptPath: "/tmp/secret\0.jsonl" })],
+    ["長いpath", stop("s1", "t1", { transcriptPath: `/${"p".repeat(4096)}` })],
   ])("不正なStop（%s）は記録せず固定codeだけをログする", async (_name, input) => {
-    let records = 0;
-    const h = harness({ store: { recordStop() { records += 1; throw new Error("secret"); } } });
+    const h = harness({ store: throwingStore("recordStop") });
 
-    await expect(h.controller.handle(input)).resolves.toBeUndefined();
-    expect(records).toBe(0);
-    expect(h.updates).toEqual([]);
+    await expect(h.controller.handle(input)).resolves.toEqual({});
     expect(h.logs).toEqual(["invalid_stop_input"]);
   });
 
-  test("必須fieldをProxyの継承風getterから補完しない", async () => {
-    let records = 0;
-    const h = harness({ store: { recordStop() { records += 1; throw new Error("secret"); } } });
-    const input = new Proxy(
-      { hook_event_name: "Stop", turn_id: "t1", transcript_path: null },
-      {
-        get(target, key, receiver) {
-          if (key === "session_id") return "s1";
-          return Reflect.get(target, key, receiver);
-        },
-      },
-    );
+  test.each([
+    ["session欠落", { hook_event_name: "UserPromptSubmit", prompt: "p" }],
+    ["session型", promptSubmit("ignored", { session_id: 1 })],
+    ["null session", promptSubmit("ignored", { session_id: null })],
+    ["空session", promptSubmit("ignored", { session_id: "" })],
+    ["NUL session", promptSubmit("ignored", { session_id: "s\0secret" })],
+    ["長いsession", promptSubmit("ignored", { session_id: "s".repeat(4097) })],
+  ])("不正なUserPromptSubmit（%s）は注入せず固定codeだけをログする", async (_name, input) => {
+    const h = harness({ store: throwingStore("getSession") });
 
-    await h.controller.handle(input);
-
-    expect(records).toBe(0);
-    expect(h.logs).toEqual(["invalid_stop_input"]);
+    await expect(h.controller.handle(input)).resolves.toEqual({});
+    expect(h.logs).toEqual(["invalid_prompt_input"]);
   });
 
-  test("null transcriptは公式入力として記録し周期時にundefinedをserviceへ渡す", async () => {
-    const h = harness({ every: 1 });
-    const input = stop("s1", "t1", null);
-    const original = structuredClone(input);
-
-    await expect(h.controller.handle(input)).resolves.toBeUndefined();
-
-    expect(h.updates).toEqual([{ sessionId: "s1", transcriptPath: undefined, force: false }]);
-    expect(input).toEqual(original);
-  });
-
-  test("同一turnと非連続duplicateは数えず更新もしない", async () => {
-    const h = harness({ every: 1 });
-
-    await h.controller.handle(stop("s1", "t1"));
-    await h.controller.handle(stop("s1", "t2"));
-    await h.controller.handle(stop("s1", "t1"));
-
-    expect(h.updates).toHaveLength(2);
-    expect((h.store as StateStore).getSession("s1")?.stopCount).toBe(2);
-  });
-
-  test("3回周期では2回目をskip、3回目だけ更新、4回目をskipする", async () => {
+  test("更新回のStopはpendingだけ保存し出力は常に{}", async () => {
     const h = harness({ every: 3 });
 
+    expect(await h.controller.handle(stop("s1", "t1"))).toEqual({});
+    expect(await h.controller.handle(stop("s1", "t2"))).toEqual({});
+    expect(await h.controller.handle(stop("s1", "t3"))).toEqual({});
+
+    expect((h.store as StateStore).getSession("s1")).toEqual(
+      expect.objectContaining({ stopCount: 3, pendingUpdate: true }),
+    );
+  });
+
+  test("pendingがあれば次のUserPromptSubmitでrename指示を注入しpendingを完了する", async () => {
+    const h = harness({ every: 1, maxChars: 32 });
+    await h.controller.handle(stop("s1", "t1"));
+
+    const output = await h.controller.handle(promptSubmit("s1"));
+
+    expect(output).toMatchObject({
+      hookSpecificOutput: { hookEventName: "UserPromptSubmit" },
+    });
+    expect(additionalContextOf(output)).toContain("codex_app__set_thread_title");
+    expect(additionalContextOf(output)).toContain("32文字");
+    expect((h.store as StateStore).getSession("s1")).toEqual(
+      expect.objectContaining({ pendingUpdate: false, lastSuccessAt: NOW }),
+    );
+  });
+
+  test("注入は1回だけで連続プロンプトでは繰り返さない", async () => {
+    const h = harness({ every: 1 });
+    await h.controller.handle(stop("s1", "t1"));
+
+    expect(additionalContextOf(await h.controller.handle(promptSubmit("s1")))).not.toBe("");
+    expect(await h.controller.handle(promptSubmit("s1"))).toEqual({});
+  });
+
+  test("pendingがなければUserPromptSubmitは何も注入しない", async () => {
+    const h = harness({ every: 3 });
+    await h.controller.handle(stop("s1", "t1"));
+
+    expect(await h.controller.handle(promptSubmit("s1"))).toEqual({});
+    expect(await h.controller.handle(promptSubmit("unknown-session"))).toEqual({});
+    expect(h.logs).toEqual([]);
+  });
+
+  test("null transcriptも公式Stop入力として受理する", async () => {
+    const h = harness({ every: 1 });
+    const input = stop("s1", "t1", { transcriptPath: null });
+    const original = structuredClone(input);
+
+    expect(await h.controller.handle(input)).toEqual({});
+    expect(input).toEqual(original);
+    expect((h.store as StateStore).getSession("s1")?.pendingUpdate).toBe(true);
+  });
+
+  test("同一turnの再送は数えずpending判定もしない", async () => {
+    const h = harness({ every: 2 });
+
+    await h.controller.handle(stop("s1", "t1"));
+    await h.controller.handle(stop("s1", "t1"));
+
+    expect((h.store as StateStore).getSession("s1")).toEqual(
+      expect.objectContaining({ stopCount: 1, pendingUpdate: false }),
+    );
+  });
+
+  test("stop_hook_active: trueの継続側Stopは回数に含めない", async () => {
+    const h = harness({ every: 1 });
+    await h.controller.handle(stop("s1", "t1"));
+
+    expect(await h.controller.handle(stop("s1", "t2", { stopHookActive: true }))).toEqual({});
+    expect((h.store as StateStore).getSession("s1")?.stopCount).toBe(1);
+  });
+
+  test("注入前にStopが続いてもpendingを維持し後から注入できる", async () => {
+    const h = harness({ every: 3 });
     await h.controller.handle(stop("s1", "t1"));
     await h.controller.handle(stop("s1", "t2"));
-    expect(h.updates).toEqual([]);
     await h.controller.handle(stop("s1", "t3"));
-    expect(h.updates).toEqual([{ sessionId: "s1", transcriptPath: "/tmp/rollout.jsonl", force: false }]);
-    await h.controller.handle(stop("s1", "t4"));
-    expect(h.updates).toHaveLength(1);
-  });
-
-  test("N回目の失敗がpendingを残すと次のdistinct Stopで周期外再試行する", async () => {
-    const store = openStore();
-    let attempt = 0;
-    const h = harness({
-      every: 3,
-      store,
-      async update(input) {
-        attempt += 1;
-        if (attempt === 1) {
-          store.markPending(input.sessionId, "pending");
-          throw new Error("provider-secret");
-        }
-        store.markSuccess(input.sessionId, "成功タイトル", "success");
-        return { status: "updated" };
-      },
-    });
-
-    await h.controller.handle(stop("s1", "t1"));
-    await h.controller.handle(stop("s1", "t2"));
-    await h.controller.handle(stop("s1", "t3"));
-    expect(store.getSession("s1")?.pendingUpdate).toBe(true);
     await h.controller.handle(stop("s1", "t4"));
 
-    expect(h.updates).toHaveLength(2);
-    expect(store.getSession("s1")).toEqual(expect.objectContaining({
-      stopCount: 4,
-      pendingUpdate: false,
-      lastAutoTitle: "成功タイトル",
-    }));
-    expect(h.logs).toEqual(["title_update_failed"]);
+    expect((h.store as StateStore).getSession("s1")?.pendingUpdate).toBe(true);
+    expect(additionalContextOf(await h.controller.handle(promptSubmit("s1")))).toContain(
+      "codex_app__set_thread_title",
+    );
   });
 
-  test("null transcriptでserviceがpendingを残した場合も次Stopで再試行する", async () => {
-    const store = openStore();
-    const h = harness({
-      every: 1,
-      store,
-      async update(input) {
-        store.markPending(input.sessionId, "pending");
-        throw new Error("missing transcript");
-      },
-    });
-
-    await h.controller.handle(stop("s1", "t1", null));
-    await h.controller.handle(stop("s1", "t2", null));
-
-    expect(h.updates).toEqual([
-      { sessionId: "s1", transcriptPath: undefined, force: false },
-      { sessionId: "s1", transcriptPath: undefined, force: false },
-    ]);
-    expect(store.getSession("s1")?.pendingUpdate).toBe(true);
-  });
-
-  test("停止済みsessionもStop数は記録するがserviceは呼ばない", async () => {
+  test("停止済みsessionはStop数だけ記録し注入もしない", async () => {
     const store = openStore();
     store.markAutoUpdateDisabled("s1", "disabled");
     const h = harness({ every: 1, store });
 
-    await h.controller.handle(stop("s1", "t1"));
-    await h.controller.handle(stop("s1", "t2"));
-
-    expect(h.updates).toEqual([]);
-    expect(store.getSession("s1")).toEqual(expect.objectContaining({
-      stopCount: 2,
-      autoUpdateDisabled: true,
-    }));
+    expect(await h.controller.handle(stop("s1", "t1"))).toEqual({});
+    expect(store.getSession("s1")?.stopCount).toBe(1);
+    expect(await h.controller.handle(promptSubmit("s1"))).toEqual({});
   });
 
-  test("停止済みでも書込みintentがあれば回復のためserviceを呼ぶ", async () => {
-    const store = openStore();
-    store.markAutoUpdateDisabled("s1", "disabled");
-    store.markTitleWritePending("s1", "force-intent", "before-force", "intent");
-    const h = harness({ every: 3, store });
-
-    await h.controller.handle(stop("s1", "t1"));
-
-    expect(h.updates).toEqual([{
-      sessionId: "s1",
-      transcriptPath: "/tmp/rollout.jsonl",
-      force: false,
-    }]);
-  });
-
-  test("別sessionのStop回数を完全に分離する", async () => {
+  test("別sessionの状態を分離する", async () => {
     const h = harness({ every: 2 });
 
     await h.controller.handle(stop("s1", "t1"));
@@ -256,40 +250,56 @@ describe("HookController", () => {
     await h.controller.handle(stop("s1", "t2"));
     await h.controller.handle(stop("s2", "t2"));
 
-    expect(h.updates).toEqual([
-      { sessionId: "s1", transcriptPath: "/tmp/rollout.jsonl", force: false },
-      { sessionId: "s2", transcriptPath: "/tmp/rollout.jsonl", force: false },
-    ]);
-    expect((h.store as StateStore).getSession("s1")?.stopCount).toBe(2);
-    expect((h.store as StateStore).getSession("s2")?.stopCount).toBe(2);
+    expect(additionalContextOf(await h.controller.handle(promptSubmit("s1")))).not.toBe("");
+    expect(additionalContextOf(await h.controller.handle(promptSubmit("s2")))).not.toBe("");
+    expect((h.store as StateStore).getSession("s1")?.pendingUpdate).toBe(false);
+    expect((h.store as StateStore).getSession("s2")?.pendingUpdate).toBe(false);
   });
 
-  test("service失敗は握りつぶし固定分類だけをログする", async () => {
-    const h = harness({ every: 1, async update() { throw new Error("transcript-secret"); } });
+  test.each(["recordStop", "markPending"] as const)(
+    "Stop側の%s失敗を固定ログへ変換する",
+    async (operation) => {
+      const h = harness({ every: 1, store: throwingStore(operation) });
 
-    await expect(h.controller.handle(stop("s1", "t1"))).resolves.toBeUndefined();
+      await expect(h.controller.handle(stop("s1", "t1"))).resolves.toEqual({});
+      expect(h.logs).toEqual(["state_store_failed"]);
+    },
+  );
 
-    expect(h.logs).toEqual(["title_update_failed"]);
-  });
+  test("UserPromptSubmit側のgetSession失敗を固定ログへ変換する", async () => {
+    const h = harness({ store: throwingStore("getSession") });
 
-  test.each([
-    ["store", { recordStop() { throw new Error("database-secret"); } }, (): string => NOW],
-    ["clock", { recordStop() { throw new Error("must not call"); } }, (): string => { throw new Error("clock-secret"); }],
-  ] as const)("%s失敗を安全に握りつぶす", async (_name, store, clock) => {
-    const h = harness({ store, clock });
-
-    await expect(h.controller.handle(stop("s1", "t1"))).resolves.toBeUndefined();
+    await expect(h.controller.handle(promptSubmit("s1"))).resolves.toEqual({});
     expect(h.logs).toEqual(["state_store_failed"]);
-    expect(h.updates).toEqual([]);
+  });
+
+  test("完了の記録に失敗したら注入せず固定ログへ変換する", async () => {
+    const base = openStore();
+    base.markPending("s1", NOW);
+    const store: HookStateStore = {
+      getSession: (sessionId) => base.getSession(sessionId),
+      recordStop: (sessionId, turnId, now) => base.recordStop(sessionId, turnId, now),
+      markPending: (sessionId, now) => base.markPending(sessionId, now),
+      markRenameContinuationFinished() {
+        throw new Error("database-secret");
+      },
+    };
+    const h = harness({ store });
+
+    await expect(h.controller.handle(promptSubmit("s1"))).resolves.toEqual({});
+    expect(h.logs).toEqual(["state_store_failed"]);
+    expect(base.getSession("s1")?.pendingUpdate).toBe(true);
   });
 
   test("logger自体がthrowしてもHook処理を妨げない", async () => {
     const h = harness({
       every: 1,
-      async update() { throw new Error("service-secret"); },
-      logger() { throw new Error("logger-secret"); },
+      store: throwingStore("recordStop"),
+      logger() {
+        throw new Error("logger-secret");
+      },
     });
 
-    await expect(h.controller.handle(stop("s1", "t1"))).resolves.toBeUndefined();
+    await expect(h.controller.handle(stop("s1", "t1"))).resolves.toEqual({});
   });
 });

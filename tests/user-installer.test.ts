@@ -30,8 +30,11 @@ async function fixture() {
   return { root, codexHome, cliSource, binDirectory };
 }
 
-function titlizeHandlers(config: Record<string, any>): Array<Record<string, any>> {
-  return (config.hooks?.Stop ?? []).flatMap((group: Record<string, any>) =>
+function titlizeHandlers(
+  config: Record<string, any>,
+  eventName: "Stop" | "UserPromptSubmit",
+): Array<Record<string, any>> {
+  return (config.hooks?.[eventName] ?? []).flatMap((group: Record<string, any>) =>
     (group.hooks ?? []).filter(
       (handler: Record<string, any>) =>
         handler.statusMessage === TITLIZE_HOOK_STATUS_MESSAGE,
@@ -46,7 +49,7 @@ describe("user installer", () => {
     );
   });
 
-  test("既存Hookを保持して全プロジェクト向けStop Hookと単体CLIを追加する", async () => {
+  test("既存Hookを保持して全プロジェクト向けStop/UserPromptSubmit Hookと単体CLIを追加する", async () => {
     const { codexHome, cliSource, binDirectory } = await fixture();
     await mkdir(codexHome, { recursive: true });
     const existing = {
@@ -94,14 +97,23 @@ describe("user installer", () => {
     expect(installed.hooks.SessionStart).toEqual(existing.hooks.SessionStart);
     expect(installed.hooks.Stop[0]).toEqual(existing.hooks.Stop[0]);
 
-    const handlers = titlizeHandlers(installed);
-    expect(handlers).toHaveLength(1);
-    expect(handlers[0]).toMatchObject({
+    const stopHandlers = titlizeHandlers(installed, "Stop");
+    expect(stopHandlers).toHaveLength(1);
+    expect(stopHandlers[0]).toMatchObject({
       type: "command",
       timeout: 150,
       statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
     });
-    expect(handlers[0]?.command).toBe(`'${join(binDirectory, "titlize")}' hook`);
+    expect(stopHandlers[0]?.command).toBe(`'${join(binDirectory, "titlize")}' hook`);
+
+    const promptHandlers = titlizeHandlers(installed, "UserPromptSubmit");
+    expect(promptHandlers).toHaveLength(1);
+    expect(promptHandlers[0]).toMatchObject({
+      type: "command",
+      timeout: 30,
+      statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
+    });
+    expect(promptHandlers[0]?.command).toBe(`'${join(binDirectory, "titlize")}' hook`);
   });
 
   test("再インストールしてもtitlize Hookを重複させない", async () => {
@@ -117,7 +129,8 @@ describe("user installer", () => {
     await installUser(options);
 
     const installed = JSON.parse(await readFile(join(codexHome, "hooks.json"), "utf8"));
-    expect(titlizeHandlers(installed)).toHaveLength(1);
+    expect(titlizeHandlers(installed, "Stop")).toHaveLength(1);
+    expect(titlizeHandlers(installed, "UserPromptSubmit")).toHaveLength(1);
     expect(await readFile(join(binDirectory, "titlize"), "utf8")).toBe("updated-cli\n");
   });
 
@@ -173,7 +186,10 @@ describe("user installer", () => {
     await uninstallUser({ codexHome, binDirectory });
 
     const uninstalled = JSON.parse(await readFile(hooksPath, "utf8"));
-    expect(titlizeHandlers(uninstalled)).toHaveLength(0);
+    expect(titlizeHandlers(uninstalled, "Stop")).toHaveLength(0);
+    expect(titlizeHandlers(uninstalled, "UserPromptSubmit")).toHaveLength(0);
+    expect(uninstalled.hooks.Stop).toBeUndefined();
+    expect(uninstalled.hooks.UserPromptSubmit).toBeUndefined();
     expect(uninstalled.hooks.SessionStart).toHaveLength(1);
     expect(await Bun.file(join(binDirectory, "titlize")).exists()).toBe(false);
   });

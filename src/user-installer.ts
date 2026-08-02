@@ -13,6 +13,7 @@ import { isAbsolute, join } from "node:path";
 
 export const TITLIZE_HOOK_STATUS_MESSAGE = "titlize: タスク名を更新しています";
 export const TITLIZE_HOOK_TIMEOUT_SECONDS = 150;
+export const TITLIZE_PROMPT_HOOK_TIMEOUT_SECONDS = 30;
 
 type JsonObject = Record<string, unknown>;
 
@@ -66,7 +67,7 @@ function isTitlizeHandler(value: unknown): boolean {
   return isObject(value) && value.statusMessage === TITLIZE_HOOK_STATUS_MESSAGE;
 }
 
-function validateStopGroups(value: unknown): unknown[] {
+function validateHookGroups(value: unknown): unknown[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new UserInstallerError("user_hooks_invalid");
 
@@ -174,8 +175,8 @@ export async function installUser(options: UserInstallOptions): Promise<UserInst
   const paths = installPaths(options.codexHome, options.binDirectory);
   const config = await readHooksConfig(paths.hooksPath);
   const hooks = (config.hooks ?? {}) as JsonObject;
-  const existingStopGroups = validateStopGroups(hooks.Stop);
-  const withoutPreviousInstall = removeTitlizeHandlers(existingStopGroups).groups;
+  const stopGroups = removeTitlizeHandlers(validateHookGroups(hooks.Stop)).groups;
+  const promptGroups = removeTitlizeHandlers(validateHookGroups(hooks.UserPromptSubmit)).groups;
   const command = `${shellQuote(paths.cliPath)} hook`;
 
   const nextConfig: JsonObject = {
@@ -183,13 +184,26 @@ export async function installUser(options: UserInstallOptions): Promise<UserInst
     hooks: {
       ...hooks,
       Stop: [
-        ...withoutPreviousInstall,
+        ...stopGroups,
         {
           hooks: [
             {
               type: "command",
               command,
               timeout: TITLIZE_HOOK_TIMEOUT_SECONDS,
+              statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
+            },
+          ],
+        },
+      ],
+      UserPromptSubmit: [
+        ...promptGroups,
+        {
+          hooks: [
+            {
+              type: "command",
+              command,
+              timeout: TITLIZE_PROMPT_HOOK_TIMEOUT_SECONDS,
               statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
             },
           ],
@@ -218,17 +232,20 @@ export async function uninstallUser(options: UserUninstallOptions): Promise<User
   const paths = installPaths(options.codexHome, options.binDirectory);
   const config = await readHooksConfig(paths.hooksPath);
   const hooks = (config.hooks ?? {}) as JsonObject;
-  const stopGroups = validateStopGroups(hooks.Stop);
-  const removal = removeTitlizeHandlers(stopGroups);
-
-  if (removal.removed) {
-    const nextHooks: JsonObject = { ...hooks };
+  const nextHooks: JsonObject = { ...hooks };
+  let removedAny = false;
+  for (const eventName of ["Stop", "UserPromptSubmit"] as const) {
+    const removal = removeTitlizeHandlers(validateHookGroups(nextHooks[eventName]));
+    if (!removal.removed) continue;
+    removedAny = true;
     if (removal.groups.length > 0) {
-      nextHooks.Stop = removal.groups;
+      nextHooks[eventName] = removal.groups;
     } else {
-      delete nextHooks.Stop;
+      delete nextHooks[eventName];
     }
+  }
 
+  if (removedAny) {
     const nextConfig: JsonObject = { ...config, hooks: nextHooks };
     try {
       const mode = await fileMode(paths.hooksPath, 0o600);

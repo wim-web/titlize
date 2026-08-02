@@ -138,6 +138,25 @@ export class StateStore {
     return this.upsert(sessionId, now, `pending_update = 1, updated_at = excluded.updated_at`, null, true);
   }
 
+  markRenameContinuationFinished(sessionId: string, now: string): SessionState {
+    return this.upsert(
+      sessionId,
+      now,
+      `pending_update = 0,
+       pending_title = NULL, pending_previous_title = NULL,
+       pending_previous_title_known = 0,
+       last_success_at = excluded.last_success_at,
+       updated_at = excluded.updated_at`,
+      null,
+      false,
+      false,
+      null,
+      null,
+      false,
+      now,
+    );
+  }
+
   markSuccess(sessionId: string, title: string, now: string): SessionState {
     return this.upsert(
       sessionId,
@@ -222,6 +241,7 @@ export class StateStore {
     pendingTitle: string | null = null,
     pendingPreviousTitle: string | null = null,
     pendingPreviousTitleKnown = false,
+    lastSuccessAt: string | null = title === null ? null : now,
   ): SessionState {
     this.db
       .query(
@@ -240,7 +260,7 @@ export class StateStore {
         pendingPreviousTitle,
         pendingPreviousTitleKnown ? 1 : 0,
         autoUpdateDisabled ? 1 : 0,
-        title === null ? null : now,
+        lastSuccessAt,
         now,
       );
     return this.requireSession(sessionId);
