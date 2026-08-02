@@ -24,6 +24,7 @@ describe("loadConfig", () => {
       every: 3,
       maxChars: 40,
       statePath: join(homedir(), ".codex", "codex-title", "state.sqlite3"),
+      codexHome: join(homedir(), ".codex"),
     });
   });
 
@@ -47,6 +48,7 @@ describe("loadConfig", () => {
       every: 5,
       maxChars: 28,
       statePath: "/tmp/from-config.sqlite3",
+      codexHome: "/tmp/codex-home",
     });
     expect(paths).toEqual(["/tmp/codex-home/titlize.json"]);
   });
@@ -86,6 +88,7 @@ describe("loadConfig", () => {
       every: 7,
       maxChars: 32,
       statePath: "/tmp/from-env.sqlite3",
+      codexHome: join(homedir(), ".codex"),
     });
   });
 
@@ -100,7 +103,28 @@ describe("loadConfig", () => {
       every: 7,
       maxChars: 32,
       statePath: "/tmp/custom.sqlite3",
+      codexHome: join(homedir(), ".codex"),
     });
+  });
+
+  test("appStatePathは設定ファイルと環境変数から読み込み、環境変数が優先される", () => {
+    expect(loadWithoutFile().appStatePath).toBeUndefined();
+    expect(loadWithFile({ appStatePath: "/tmp/state_5.sqlite" }).appStatePath).toBe(
+      "/tmp/state_5.sqlite",
+    );
+    expect(
+      loadWithFile(
+        { appStatePath: "/tmp/from-file.sqlite" },
+        { CODEX_TITLE_APP_STATE_PATH: "/tmp/from-env.sqlite" },
+      ).appStatePath,
+    ).toBe("/tmp/from-env.sqlite");
+  });
+
+  test.each(["", "   "])("空のappStatePathを拒否する: %j", (value) => {
+    expect(() => loadWithoutFile({ CODEX_TITLE_APP_STATE_PATH: value })).toThrow(
+      "CODEX_TITLE_APP_STATE_PATH",
+    );
+    expect(() => loadWithFile({ appStatePath: value })).toThrow("config appStatePath");
   });
 
   test("CODEX_HOMEを状態パスのフォールバックに使う", () => {

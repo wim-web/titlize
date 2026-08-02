@@ -4,11 +4,15 @@ export interface SessionState {
   lastTurnId: string | null;
   pendingUpdate: boolean;
   lastAutoTitle: string | null;
-  pendingTitle: string | null;
-  pendingPreviousTitle: string | null;
-  pendingPreviousTitleKnown: boolean;
   autoUpdateDisabled: boolean;
   lastSuccessAt: string | null;
+  updatedAt: string;
+}
+
+export interface PendingWrite {
+  sessionId: string;
+  turnId: string;
+  baselineTitle: string;
   updatedAt: string;
 }
 
@@ -16,4 +20,6 @@ export interface TitleConfig {
   every: number;
   maxChars: number;
   statePath: string;
+  codexHome: string;
+  appStatePath?: string;
 }

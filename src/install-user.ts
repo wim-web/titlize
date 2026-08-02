@@ -44,7 +44,7 @@ export async function main(
     console.log(`titlize CLIをインストールしました: ${result.cliPath}`);
     console.log(`ユーザー共通Hookを更新しました: ${result.hooksPath}`);
     console.log(`設定ファイル: ${result.configPath}`);
-    console.log("Codexで /hooks を開き、titlizeのHook（合計5件）を信頼してください。");
+    console.log("Codexで /hooks を開き、titlizeのHook（合計2件）を信頼してください。");
     return 0;
   } catch (error) {
     const code =

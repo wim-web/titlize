@@ -14,10 +14,6 @@ import {
   DEFAULT_TITLE_CONFIG_FILE,
   TITLE_CONFIG_FILE_NAME,
 } from "./config";
-import {
-  READ_THREAD_TOOL_NAME,
-  SET_THREAD_TITLE_TOOL_NAME,
-} from "./hook-controller";
 
 export const TITLIZE_HOOK_STATUS_MESSAGE = "titlize: タスク名を更新しています";
 export const TITLIZE_HOOK_TIMEOUT_SECONDS = 150;
@@ -204,65 +200,45 @@ export async function installUser(options: UserInstallOptions): Promise<UserInst
   const postToolGroups = removeTitlizeHandlers(validateHookGroups(hooks.PostToolUse)).groups;
   const command = `${shellQuote(paths.cliPath)} hook`;
 
+  // Title reads and write verification happen against the app state DB, so
+  // only Stop and UserPromptSubmit are installed. PreToolUse/PostToolUse
+  // entries from older releases are removed; the keys survive only when the
+  // user has their own handlers there.
+  const nextHooks: JsonObject = {
+    ...hooks,
+    Stop: [
+      ...stopGroups,
+      {
+        hooks: [
+          {
+            type: "command",
+            command,
+            timeout: TITLIZE_HOOK_TIMEOUT_SECONDS,
+            statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
+          },
+        ],
+      },
+    ],
+    UserPromptSubmit: [
+      ...promptGroups,
+      {
+        hooks: [
+          {
+            type: "command",
+            command,
+            timeout: TITLIZE_PROMPT_HOOK_TIMEOUT_SECONDS,
+            statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
+          },
+        ],
+      },
+    ],
+  };
+  setOrDeleteHookGroups(nextHooks, "PreToolUse", preToolGroups);
+  setOrDeleteHookGroups(nextHooks, "PostToolUse", postToolGroups);
+
   const nextConfig: JsonObject = {
     ...config,
-    hooks: {
-      ...hooks,
-      Stop: [
-        ...stopGroups,
-        {
-          hooks: [
-            {
-              type: "command",
-              command,
-              timeout: TITLIZE_HOOK_TIMEOUT_SECONDS,
-              statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
-            },
-          ],
-        },
-      ],
-      UserPromptSubmit: [
-        ...promptGroups,
-        {
-          hooks: [
-            {
-              type: "command",
-              command,
-              timeout: TITLIZE_PROMPT_HOOK_TIMEOUT_SECONDS,
-              statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
-            },
-          ],
-        },
-      ],
-      PreToolUse: [
-        ...preToolGroups,
-        {
-          matcher: `^${SET_THREAD_TITLE_TOOL_NAME}$`,
-          hooks: [
-            {
-              type: "command",
-              command,
-              timeout: TITLIZE_PROMPT_HOOK_TIMEOUT_SECONDS,
-              statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
-            },
-          ],
-        },
-      ],
-      PostToolUse: [
-        ...postToolGroups,
-        ...[READ_THREAD_TOOL_NAME, SET_THREAD_TITLE_TOOL_NAME].map((toolName) => ({
-          matcher: `^${toolName}$`,
-          hooks: [
-            {
-              type: "command",
-              command,
-              timeout: TITLIZE_PROMPT_HOOK_TIMEOUT_SECONDS,
-              statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
-            },
-          ],
-        })),
-      ],
-    },
+    hooks: nextHooks,
   };
 
   try {
@@ -281,6 +257,18 @@ export async function installUser(options: UserInstallOptions): Promise<UserInst
   } catch (error) {
     if (error instanceof UserInstallerError) throw error;
     throw new UserInstallerError("user_install_failed");
+  }
+}
+
+function setOrDeleteHookGroups(
+  hooks: JsonObject,
+  eventName: string,
+  groups: unknown[],
+): void {
+  if (groups.length > 0) {
+    hooks[eventName] = groups;
+  } else {
+    delete hooks[eventName];
   }
 }
 

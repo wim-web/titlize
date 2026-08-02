@@ -1,3 +1,8 @@
+import {
+  AppDbTitleReader,
+  resolveAppStatePath,
+  type AppTitleReader,
+} from "./app-db";
 import { loadConfig } from "./config";
 import {
   HookController,
@@ -96,11 +101,14 @@ export interface CliRuntime {
 
 export interface RuntimeFactories {
   createStateStore(path: string): CliStateStore;
+  createTitleReader(config: TitleConfig): AppTitleReader;
   createController(options: HookControllerOptions): CliRuntime["controller"];
 }
 
 const DEFAULT_RUNTIME_FACTORIES: RuntimeFactories = {
   createStateStore: (path) => new StateStore(path),
+  createTitleReader: (config) =>
+    new AppDbTitleReader(resolveAppStatePath(config.codexHome, config.appStatePath)),
   createController: (options) => new HookController(options),
 };
 
@@ -115,6 +123,7 @@ export function composeRuntime(
     store = factories.createStateStore(config.statePath);
     const controller = factories.createController({
       store,
+      titleReader: factories.createTitleReader(config),
       every: config.every,
       maxChars: config.maxChars,
       clock: (): string => new Date().toISOString(),
@@ -159,8 +168,7 @@ type CliLogCode =
 const CLI_LOG_LINES: Record<CliLogCode, string> = {
   invalid_stop_input: "codex-title: invalid_stop_input\n",
   invalid_prompt_input: "codex-title: invalid_prompt_input\n",
-  invalid_tool_input: "codex-title: invalid_tool_input\n",
-  title_read_failed: "codex-title: title_read_failed\n",
+  app_db_read_failed: "codex-title: app_db_read_failed\n",
   state_store_failed: "codex-title: state_store_failed\n",
   invalid_arguments: "codex-title: invalid_arguments\n",
   hook_input_invalid: "codex-title: hook_input_invalid\n",
