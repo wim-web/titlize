@@ -199,6 +199,111 @@ describe("StateStore", () => {
     }));
   });
 
+  test("pending更新から同一turnのタイトル確認と書込みを相関して成功を記録する", () => {
+    const { store } = openStore();
+    store.markPending("s1", "pending");
+
+    expect(store.beginRenameAttempt("s1", "turn-1", "attempt")).toBe("started");
+    expect(store.beginRenameAttempt("s1", "turn-1", "duplicate")).toBe("ignored");
+    expect(store.isTitleReadExpected("s1", "turn-1")).toBe(true);
+    expect(store.observeCurrentTitle("s1", "turn-1", "初期", "read")).toBe("authorized");
+    expect(store.isTitleReadExpected("s1", "turn-1")).toBe(false);
+    expect(store.prepareTitleWrite("s1", "turn-1", "自動", "intent")).toBe("allow");
+    expect(store.getSession("s1")).toEqual(expect.objectContaining({
+      pendingUpdate: true,
+      pendingTitle: "自動",
+      pendingPreviousTitle: "初期",
+      pendingPreviousTitleKnown: true,
+    }));
+    expect(store.completeTitleWrite("s1", "turn-1", true, "success")).toBe("success");
+    expect(store.getSession("s1")).toEqual(expect.objectContaining({
+      pendingUpdate: false,
+      pendingTitle: null,
+      lastAutoTitle: "自動",
+      lastSuccessAt: "success",
+    }));
+  });
+
+  test("初回はnullを含む現在タイトルを既知baselineとして書込みintentへ保存する", () => {
+    const { store } = openStore();
+    store.markPending("s1", "pending");
+    store.beginRenameAttempt("s1", "turn-1", "attempt");
+
+    expect(store.observeCurrentTitle("s1", "turn-1", null, "read")).toBe("authorized");
+    expect(store.prepareTitleWrite("s1", "turn-1", "初回", "intent")).toBe("allow");
+    expect(store.getSession("s1")).toEqual(expect.objectContaining({
+      pendingPreviousTitle: null,
+      pendingPreviousTitleKnown: true,
+    }));
+  });
+
+  test("前回自動タイトルと現在タイトルが違えば手動変更として停止する", () => {
+    const { store } = openStore();
+    store.markSuccess("s1", "自動A", "success");
+    store.markPending("s1", "pending");
+    store.beginRenameAttempt("s1", "turn-1", "attempt");
+
+    expect(store.observeCurrentTitle("s1", "turn-1", "手動M", "read")).toBe("manual_change");
+    expect(store.prepareTitleWrite("s1", "turn-1", "自動B", "write")).toBe("deny");
+    expect(store.getSession("s1")).toEqual(expect.objectContaining({
+      pendingUpdate: false,
+      autoUpdateDisabled: true,
+      lastAutoTitle: "自動A",
+    }));
+  });
+
+  test("未確定intentが現在タイトルへ反映済みなら成功として回復する", () => {
+    const { store } = openStore();
+    store.markSuccess("s1", "自動A", "success-a");
+    store.markTitleWritePending("s1", "自動B", "自動A", "intent");
+    store.beginRenameAttempt("s1", "turn-2", "attempt");
+
+    expect(store.observeCurrentTitle("s1", "turn-2", "自動B", "read")).toBe("already_applied");
+    expect(store.getSession("s1")).toEqual(expect.objectContaining({
+      pendingUpdate: false,
+      pendingTitle: null,
+      lastAutoTitle: "自動B",
+      lastSuccessAt: "read",
+    }));
+  });
+
+  test("未確定intentが書込み前タイトルのままならintentをclearして再書込みを許可する", () => {
+    const { store } = openStore();
+    store.markSuccess("s1", "自動A", "success-a");
+    store.markTitleWritePending("s1", "自動B", "自動A", "intent");
+    store.beginRenameAttempt("s1", "turn-2", "attempt");
+
+    expect(store.observeCurrentTitle("s1", "turn-2", "自動A", "read")).toBe("authorized");
+    expect(store.prepareTitleWrite("s1", "turn-2", "自動C", "next-intent")).toBe("allow");
+    expect(store.getSession("s1")).toEqual(expect.objectContaining({
+      pendingTitle: "自動C",
+      pendingPreviousTitle: "自動A",
+    }));
+  });
+
+  test("未確定intentの候補・書込み前タイトルのどちらでもなければ手動変更にする", () => {
+    const { store } = openStore();
+    store.markSuccess("s1", "自動A", "success-a");
+    store.markTitleWritePending("s1", "自動B", "自動A", "intent");
+    store.beginRenameAttempt("s1", "turn-2", "attempt");
+
+    expect(store.observeCurrentTitle("s1", "turn-2", "手動M", "read")).toBe("manual_change");
+    expect(store.getSession("s1")).toEqual(expect.objectContaining({
+      pendingTitle: null,
+      autoUpdateDisabled: true,
+    }));
+  });
+
+  test("attempt外・別turnのツール結果は通常操作として無視する", () => {
+    const { store } = openStore();
+    store.markPending("s1", "pending");
+    store.beginRenameAttempt("s1", "turn-1", "attempt");
+
+    expect(store.observeCurrentTitle("s1", "other", "title", "read")).toBe("ignored");
+    expect(store.prepareTitleWrite("s1", "other", "candidate", "write")).toBe("ignored");
+    expect(store.completeTitleWrite("s1", "other", true, "done")).toBe("ignored");
+  });
+
   test("タイトル書込みintentを永続化し、通常のpending更新では保持する", () => {
     const { store } = openStore();
     store.recordStop("s1", "t1", "stop");

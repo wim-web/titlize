@@ -14,6 +14,10 @@ import {
   DEFAULT_TITLE_CONFIG_FILE,
   TITLE_CONFIG_FILE_NAME,
 } from "./config";
+import {
+  READ_THREAD_TOOL_NAME,
+  SET_THREAD_TITLE_TOOL_NAME,
+} from "./hook-controller";
 
 export const TITLIZE_HOOK_STATUS_MESSAGE = "titlize: タスク名を更新しています";
 export const TITLIZE_HOOK_TIMEOUT_SECONDS = 150;
@@ -196,6 +200,8 @@ export async function installUser(options: UserInstallOptions): Promise<UserInst
   const hooks = (config.hooks ?? {}) as JsonObject;
   const stopGroups = removeTitlizeHandlers(validateHookGroups(hooks.Stop)).groups;
   const promptGroups = removeTitlizeHandlers(validateHookGroups(hooks.UserPromptSubmit)).groups;
+  const preToolGroups = removeTitlizeHandlers(validateHookGroups(hooks.PreToolUse)).groups;
+  const postToolGroups = removeTitlizeHandlers(validateHookGroups(hooks.PostToolUse)).groups;
   const command = `${shellQuote(paths.cliPath)} hook`;
 
   const nextConfig: JsonObject = {
@@ -228,6 +234,34 @@ export async function installUser(options: UserInstallOptions): Promise<UserInst
           ],
         },
       ],
+      PreToolUse: [
+        ...preToolGroups,
+        {
+          matcher: `^${SET_THREAD_TITLE_TOOL_NAME}$`,
+          hooks: [
+            {
+              type: "command",
+              command,
+              timeout: TITLIZE_PROMPT_HOOK_TIMEOUT_SECONDS,
+              statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
+            },
+          ],
+        },
+      ],
+      PostToolUse: [
+        ...postToolGroups,
+        ...[READ_THREAD_TOOL_NAME, SET_THREAD_TITLE_TOOL_NAME].map((toolName) => ({
+          matcher: `^${toolName}$`,
+          hooks: [
+            {
+              type: "command",
+              command,
+              timeout: TITLIZE_PROMPT_HOOK_TIMEOUT_SECONDS,
+              statusMessage: TITLIZE_HOOK_STATUS_MESSAGE,
+            },
+          ],
+        })),
+      ],
     },
   };
 
@@ -258,7 +292,7 @@ export async function uninstallUser(options: UserUninstallOptions): Promise<User
   const hooks = (config.hooks ?? {}) as JsonObject;
   const nextHooks: JsonObject = { ...hooks };
   let removedAny = false;
-  for (const eventName of ["Stop", "UserPromptSubmit"] as const) {
+  for (const eventName of ["Stop", "UserPromptSubmit", "PreToolUse", "PostToolUse"] as const) {
     const removal = removeTitlizeHandlers(validateHookGroups(nextHooks[eventName]));
     if (!removal.removed) continue;
     removedAny = true;
