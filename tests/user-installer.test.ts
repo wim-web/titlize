@@ -91,6 +91,12 @@ describe("user installer", () => {
     expect(result.cliPath).toBe(join(binDirectory, "titlize"));
     expect(await readFile(result.cliPath, "utf8")).toBe("compiled-cli\n");
     expect((await stat(result.cliPath)).mode & 0o777).toBe(0o755);
+    expect(result.configPath).toBe(join(codexHome, "titlize.json"));
+    expect(JSON.parse(await readFile(result.configPath, "utf8"))).toEqual({
+      every: 3,
+      maxChars: 40,
+    });
+    expect((await stat(result.configPath)).mode & 0o777).toBe(0o600);
 
     const installed = JSON.parse(await readFile(result.hooksPath, "utf8"));
     expect(installed.description).toBe("existing user hooks");
@@ -125,6 +131,9 @@ describe("user installer", () => {
     };
 
     await installUser(options);
+    const configPath = join(codexHome, "titlize.json");
+    const customConfig = '{"every":9,"maxChars":24}\n';
+    await writeFile(configPath, customConfig);
     await writeFile(cliSource, "updated-cli\n");
     await installUser(options);
 
@@ -132,6 +141,7 @@ describe("user installer", () => {
     expect(titlizeHandlers(installed, "Stop")).toHaveLength(1);
     expect(titlizeHandlers(installed, "UserPromptSubmit")).toHaveLength(1);
     expect(await readFile(join(binDirectory, "titlize"), "utf8")).toBe("updated-cli\n");
+    expect(await readFile(configPath, "utf8")).toBe(customConfig);
   });
 
   test("不正な既存hooks.jsonを上書きしない", async () => {
@@ -154,6 +164,7 @@ describe("user installer", () => {
 
     expect(await readFile(hooksPath, "utf8")).toBe("not-json\n");
     expect(await Bun.file(join(binDirectory, "titlize")).exists()).toBe(false);
+    expect(await Bun.file(join(codexHome, "titlize.json")).exists()).toBe(false);
   });
 
   test("旧Bun bundle配置をインストール成功後に削除する", async () => {
@@ -175,6 +186,9 @@ describe("user installer", () => {
       binDirectory,
       cliSource,
     });
+    const configPath = join(codexHome, "titlize.json");
+    const customConfig = '{"every":12,"maxChars":36}\n';
+    await writeFile(configPath, customConfig);
 
     const hooksPath = join(codexHome, "hooks.json");
     const installed = JSON.parse(await readFile(hooksPath, "utf8"));
@@ -192,5 +206,6 @@ describe("user installer", () => {
     expect(uninstalled.hooks.UserPromptSubmit).toBeUndefined();
     expect(uninstalled.hooks.SessionStart).toHaveLength(1);
     expect(await Bun.file(join(binDirectory, "titlize")).exists()).toBe(false);
+    expect(await readFile(configPath, "utf8")).toBe(customConfig);
   });
 });

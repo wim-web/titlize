@@ -10,6 +10,10 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import {
+  DEFAULT_TITLE_CONFIG_FILE,
+  TITLE_CONFIG_FILE_NAME,
+} from "./config";
 
 export const TITLIZE_HOOK_STATUS_MESSAGE = "titlize: タスク名を更新しています";
 export const TITLIZE_HOOK_TIMEOUT_SECONDS = 150;
@@ -32,6 +36,7 @@ export interface UserInstallOptions {
 
 export interface UserInstallResult {
   cliPath: string;
+  configPath: string;
   hooksPath: string;
 }
 
@@ -156,6 +161,19 @@ async function atomicCopy(source: string, destination: string): Promise<void> {
   }
 }
 
+async function createDefaultConfig(path: string): Promise<void> {
+  try {
+    await writeFile(
+      path,
+      `${JSON.stringify(DEFAULT_TITLE_CONFIG_FILE, null, 2)}\n`,
+      { encoding: "utf8", flag: "wx", mode: 0o600 },
+    );
+  } catch (error) {
+    if (hasCode(error, "EEXIST")) return;
+    throw error;
+  }
+}
+
 function installPaths(
   codexHome: string,
   binDirectory: string,
@@ -163,6 +181,7 @@ function installPaths(
   return {
     legacyDirectory: join(codexHome, "titlize"),
     cliPath: join(binDirectory, "titlize"),
+    configPath: join(codexHome, TITLE_CONFIG_FILE_NAME),
     hooksPath: join(codexHome, "hooks.json"),
   };
 }
@@ -215,11 +234,16 @@ export async function installUser(options: UserInstallOptions): Promise<UserInst
   try {
     await mkdir(options.codexHome, { recursive: true });
     await mkdir(options.binDirectory, { recursive: true });
+    await createDefaultConfig(paths.configPath);
     await atomicCopy(options.cliSource, paths.cliPath);
     const mode = await fileMode(paths.hooksPath, 0o600);
     await atomicWrite(paths.hooksPath, `${JSON.stringify(nextConfig, null, 2)}\n`, mode);
     await rm(paths.legacyDirectory, { recursive: true, force: true });
-    return { cliPath: paths.cliPath, hooksPath: paths.hooksPath };
+    return {
+      cliPath: paths.cliPath,
+      configPath: paths.configPath,
+      hooksPath: paths.hooksPath,
+    };
   } catch (error) {
     if (error instanceof UserInstallerError) throw error;
     throw new UserInstallerError("user_install_failed");
@@ -263,5 +287,9 @@ export async function uninstallUser(options: UserUninstallOptions): Promise<User
     throw new UserInstallerError("user_uninstall_failed");
   }
 
-  return { cliPath: paths.cliPath, hooksPath: paths.hooksPath };
+  return {
+    cliPath: paths.cliPath,
+    configPath: paths.configPath,
+    hooksPath: paths.hooksPath,
+  };
 }
