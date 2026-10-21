@@ -20,7 +20,9 @@ UserPromptSubmit Hook: pendingがあればアプリDBで現在タイトルを確
 
 ## セットアップ
 
-Bun 1.3系が必要です。
+`package.json`の`packageManager`に固定したBunを使用してください。CIも同じ値を参照します。
+
+2026-10-21時点で、eMudhra中間CA漏えいに対するBunの修正版は未確認です。現行の固定版は対策済みではありません。[対応状況と修正版公開後の更新・再ビルド手順](docs/security/emudhra-2026-10.md)を確認してください。
 
 ```bash
 bun install
